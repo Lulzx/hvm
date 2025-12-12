@@ -4,13 +4,22 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Performance-optimized module settings
+    const exe_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Enable aggressive optimizations for release builds
+    if (optimize != .Debug) {
+        exe_module.unwind_tables = .none;
+        exe_module.omit_frame_pointer = true;
+    }
+
     const exe = b.addExecutable(.{
         .name = "hvm3",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+        .root_module = exe_module,
     });
 
     b.installArtifact(exe);

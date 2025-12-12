@@ -76,41 +76,41 @@ const LOC_MASK: u64 = 0xFFFFFFFFFF;
 const LAB_SHIFT: u6 = 8;
 const LOC_SHIFT: u6 = 24;
 
-pub fn term_new(tag: Tag, lab: Lab, loc: u64) Term {
+pub inline fn term_new(tag: Tag, lab: Lab, loc: u64) Term {
     return @as(Term, tag) |
         (@as(Term, lab) << LAB_SHIFT) |
         (@as(Term, loc) << LOC_SHIFT);
 }
 
-pub fn term_tag(x: Term) Tag {
+pub inline fn term_tag(x: Term) Tag {
     return @truncate(x & TAG_MASK);
 }
 
-pub fn term_lab(x: Term) Lab {
+pub inline fn term_lab(x: Term) Lab {
     return @truncate((x >> LAB_SHIFT) & LAB_MASK);
 }
 
-pub fn term_loc(x: Term) u64 {
+pub inline fn term_loc(x: Term) u64 {
     return (x >> LOC_SHIFT) & LOC_MASK;
 }
 
-pub fn term_get_bit(x: Term) u1 {
+pub inline fn term_get_bit(x: Term) u1 {
     return @truncate((x >> 7) & 1);
 }
 
-pub fn term_set_bit(x: Term) Term {
+pub inline fn term_set_bit(x: Term) Term {
     return x | SUB_MASK;
 }
 
-pub fn term_rem_bit(x: Term) Term {
+pub inline fn term_rem_bit(x: Term) Term {
     return x & ~SUB_MASK;
 }
 
-pub fn term_set_loc(x: Term, loc: u64) Term {
+pub inline fn term_set_loc(x: Term, loc: u64) Term {
     return (x & 0x0000000000FFFFFF) | (@as(Term, loc) << LOC_SHIFT);
 }
 
-pub fn term_is_atom(t: Term) bool {
+pub inline fn term_is_atom(t: Term) bool {
     const tg = term_tag(t);
     return tg == ERA or tg == W32 or tg == CHR;
 }
@@ -125,13 +125,17 @@ pub const MAX_BOOK_SIZE: usize = 65536;
 
 pub const BookFn = *const fn (Term) Term;
 
+/// HVM runtime state - hot fields grouped together for cache efficiency
 pub const State = struct {
-    sbuf: []Term, // Stack buffer
-    spos: u64, // Stack position
+    // Hot fields (accessed every reduction step) - grouped at start
     heap: []Term, // Heap buffer
+    sbuf: []Term, // Stack buffer
     size: u64, // Heap size (next free location)
+    spos: u64, // Stack position
     itrs: u64, // Interaction counter
     frsh: u64, // Fresh label generator
+
+    // Cold fields (accessed less frequently)
     book: [MAX_BOOK_SIZE]?BookFn, // Function lookup table
     cari: [MAX_BOOK_SIZE]u16, // Constructor arities
     clen: [MAX_BOOK_SIZE]u16, // Case lengths
@@ -140,8 +144,8 @@ pub const State = struct {
 
     pub fn init(allocator: std.mem.Allocator) !*State {
         const state = try allocator.create(State);
-        state.sbuf = try allocator.alloc(Term, MAX_STACK_SIZE);
         state.heap = try allocator.alloc(Term, MAX_HEAP_SIZE);
+        state.sbuf = try allocator.alloc(Term, MAX_STACK_SIZE);
         state.spos = 0;
         state.size = 1; // Reserve location 0
         state.itrs = 0;
@@ -236,48 +240,67 @@ pub fn fresh() u64 {
     return val;
 }
 
-pub fn swap(loc: u64, term: Term) Term {
-    const val = HVM.heap[loc];
-    HVM.heap[loc] = term;
-    if (val == 0) {
-        print("SWAP 0 at {x}\n", .{loc});
-        std.process.exit(1);
+/// Fast heap swap - in release mode, skips validation for speed
+pub inline fn swap(loc: u64, term: Term) Term {
+    if (comptime std.debug.runtime_safety) {
+        const val = HVM.heap[loc];
+        HVM.heap[loc] = term;
+        if (val == 0) {
+            print("SWAP 0 at {x}\n", .{loc});
+            std.process.exit(1);
+        }
+        return val;
+    } else {
+        const val = HVM.heap[loc];
+        HVM.heap[loc] = term;
+        return val;
     }
-    return val;
 }
 
-pub fn got(loc: u64) Term {
-    const val = HVM.heap[loc];
-    if (val == 0) {
-        print("GOT 0 at {x}\n", .{loc});
-        std.process.exit(1);
+/// Fast heap read - in release mode, skips validation for speed
+pub inline fn got(loc: u64) Term {
+    if (comptime std.debug.runtime_safety) {
+        const val = HVM.heap[loc];
+        if (val == 0) {
+            print("GOT 0 at {x}\n", .{loc});
+            std.process.exit(1);
+        }
+        return val;
+    } else {
+        return HVM.heap[loc];
     }
-    return val;
 }
 
-pub fn set(loc: u64, term: Term) void {
+/// Fast heap write
+pub inline fn set(loc: u64, term: Term) void {
     HVM.heap[loc] = term;
 }
 
-pub fn sub(loc: u64, term: Term) void {
-    set(loc, term_set_bit(term));
+/// Set with substitution bit
+pub inline fn sub(loc: u64, term: Term) void {
+    HVM.heap[loc] = term | SUB_MASK; // Inline term_set_bit
 }
 
-pub fn take(loc: u64) Term {
+/// Swap with VOID (take ownership)
+pub inline fn take(loc: u64) Term {
     return swap(loc, VOID);
 }
 
-pub fn alloc_node(arity: u64) u64 {
-    if (HVM.size + arity > MAX_HEAP_SIZE) {
-        print("Heap memory limit exceeded\n", .{});
-        std.process.exit(1);
+/// Bump allocator for heap nodes
+pub inline fn alloc_node(arity: u64) u64 {
+    if (comptime std.debug.runtime_safety) {
+        if (HVM.size + arity > MAX_HEAP_SIZE) {
+            print("Heap memory limit exceeded\n", .{});
+            std.process.exit(1);
+        }
     }
     const old = HVM.size;
     HVM.size += arity;
     return old;
 }
 
-pub fn inc_itr() void {
+/// Increment interaction counter
+pub inline fn inc_itr() void {
     HVM.itrs += 1;
 }
 
@@ -285,16 +308,20 @@ pub fn inc_itr() void {
 // Stack Operations
 // =============================================================================
 
-pub fn spush(term: Term) void {
-    if (HVM.spos >= MAX_STACK_SIZE) {
-        print("Stack memory limit exceeded\n", .{});
-        std.process.exit(1);
+/// Push term onto evaluation stack
+pub inline fn spush(term: Term) void {
+    if (comptime std.debug.runtime_safety) {
+        if (HVM.spos >= MAX_STACK_SIZE) {
+            print("Stack memory limit exceeded\n", .{});
+            std.process.exit(1);
+        }
     }
     HVM.sbuf[HVM.spos] = term;
     HVM.spos += 1;
 }
 
-pub fn spop() Term {
+/// Pop term from evaluation stack
+pub inline fn spop() Term {
     HVM.spos -= 1;
     return HVM.sbuf[HVM.spos];
 }
@@ -303,21 +330,22 @@ pub fn spop() Term {
 // Interaction Rules: APP
 // =============================================================================
 
-// (lambda x.body arg) -> body[x := arg]
-pub fn reduce_app_lam(app: Term, lam: Term) Term {
-    inc_itr();
+/// Beta reduction: (λx.body arg) -> body[x := arg]
+/// This is the most common interaction - highly optimized
+inline fn reduce_app_lam(app: Term, lam: Term) Term {
+    HVM.itrs += 1;
     const app_loc = term_loc(app);
     const lam_loc = term_loc(lam);
-    const bod = got(lam_loc + 0);
-    const arg = got(app_loc + 1);
-    sub(lam_loc + 0, arg);
+    const bod = HVM.heap[lam_loc];
+    const arg = HVM.heap[app_loc + 1];
+    HVM.heap[lam_loc] = arg | SUB_MASK; // Direct substitution
     return bod;
 }
 
-// (era arg) -> era
-pub fn reduce_app_era(app: Term, era: Term) Term {
+/// Erasure application: (* arg) -> *
+inline fn reduce_app_era(app: Term, era: Term) Term {
     _ = app;
-    inc_itr();
+    HVM.itrs += 1;
     return era;
 }
 
@@ -365,11 +393,11 @@ pub fn reduce_app_w32(app: Term, w32: Term) Term {
 // Interaction Rules: DUP
 // =============================================================================
 
-// !lab{x, y} = era -> x <- era; y <- era
-pub fn reduce_dup_era(dup: Term, era: Term) Term {
-    inc_itr();
+/// Duplication of erasure: !lab{x, y} = * -> x <- *; y <- *
+inline fn reduce_dup_era(dup: Term, era: Term) Term {
+    HVM.itrs += 1;
     const dup_loc = term_loc(dup);
-    sub(dup_loc + 0, era);
+    HVM.heap[dup_loc] = era | SUB_MASK;
     return era;
 }
 
@@ -405,43 +433,44 @@ pub fn reduce_dup_lam(dup: Term, lam: Term) Term {
     }
 }
 
-// !lab{x, y} = {a, b} -> annihilation or commutation
-pub fn reduce_dup_sup(dup: Term, sup: Term) Term {
-    inc_itr();
+/// DUP+SUP interaction: annihilation (same label) or commutation (different labels)
+/// This is critical for optimal sharing - highly optimized
+inline fn reduce_dup_sup(dup: Term, sup: Term) Term {
+    HVM.itrs += 1;
     const dup_loc = term_loc(dup);
     const dup_lab = term_lab(dup);
     const sup_lab = term_lab(sup);
     const sup_loc = term_loc(sup);
 
     if (dup_lab == sup_lab) {
-        // Annihilation: same labels
-        const tm0 = got(sup_loc + 0);
-        const tm1 = got(sup_loc + 1);
+        // Annihilation: same labels - O(1) cancellation
+        const tm0 = HVM.heap[sup_loc];
+        const tm1 = HVM.heap[sup_loc + 1];
         if (term_tag(dup) == DP0) {
-            sub(dup_loc + 0, tm1);
+            HVM.heap[dup_loc] = tm1 | SUB_MASK;
             return tm0;
         } else {
-            sub(dup_loc + 0, tm0);
+            HVM.heap[dup_loc] = tm0 | SUB_MASK;
             return tm1;
         }
     } else {
-        // Commutation: different labels
+        // Commutation: different labels - creates new nodes
         const loc = alloc_node(4);
-        const du0 = sup_loc + 0;
+        const du0 = sup_loc;
         const du1 = sup_loc + 1;
-        const su0 = loc + 0;
+        const su0 = loc;
         const su1 = loc + 2;
 
-        set(su0 + 0, term_new(DP0, dup_lab, du0));
-        set(su0 + 1, term_new(DP0, dup_lab, du1));
-        set(su1 + 0, term_new(DP1, dup_lab, du0));
-        set(su1 + 1, term_new(DP1, dup_lab, du1));
+        HVM.heap[su0] = term_new(DP0, dup_lab, du0);
+        HVM.heap[su0 + 1] = term_new(DP0, dup_lab, du1);
+        HVM.heap[su1] = term_new(DP1, dup_lab, du0);
+        HVM.heap[su1 + 1] = term_new(DP1, dup_lab, du1);
 
         if (term_tag(dup) == DP0) {
-            sub(dup_loc + 0, term_new(SUP, sup_lab, su1));
+            HVM.heap[dup_loc] = term_new(SUP, sup_lab, su1) | SUB_MASK;
             return term_new(SUP, sup_lab, su0);
         } else {
-            sub(dup_loc + 0, term_new(SUP, sup_lab, su0));
+            HVM.heap[dup_loc] = term_new(SUP, sup_lab, su0) | SUB_MASK;
             return term_new(SUP, sup_lab, su1);
         }
     }
@@ -477,11 +506,12 @@ pub fn reduce_dup_ctr(dup: Term, ctr: Term) Term {
     }
 }
 
-// !lab{x, y} = W32 -> x <- W32; y <- W32
-pub fn reduce_dup_w32(dup: Term, w32: Term) Term {
-    inc_itr();
+/// Duplication of number: !lab{x, y} = W32 -> x <- W32; y <- W32
+/// Numbers are cheap to duplicate (just copy the value)
+inline fn reduce_dup_w32(dup: Term, w32: Term) Term {
+    HVM.itrs += 1;
     const dup_loc = term_loc(dup);
-    sub(dup_loc + 0, w32);
+    HVM.heap[dup_loc] = w32 | SUB_MASK;
     return w32;
 }
 
@@ -750,13 +780,14 @@ pub fn reduce_opx_ctr(opx: Term, ctr: Term) Term {
     std.process.exit(1);
 }
 
-pub fn reduce_opx_w32(opx: Term, nmx: Term) Term {
-    inc_itr();
+/// First operand ready: convert OPX to OPY
+inline fn reduce_opx_w32(opx: Term, nmx: Term) Term {
+    HVM.itrs += 1;
     const opx_lab = term_lab(opx);
     const opx_loc = term_loc(opx);
-    const nmy = got(opx_loc + 1);
-    set(opx_loc + 0, nmy);
-    set(opx_loc + 1, nmx);
+    const nmy = HVM.heap[opx_loc + 1];
+    HVM.heap[opx_loc] = nmy;
+    HVM.heap[opx_loc + 1] = nmx;
     return term_new(OPY, opx_lab, opx_loc);
 }
 
@@ -812,25 +843,28 @@ pub fn reduce_opy_ctr(opy: Term, ctr: Term) Term {
     std.process.exit(1);
 }
 
-pub fn reduce_opy_w32(opy: Term, w32: Term) Term {
-    inc_itr();
+/// Arithmetic evaluation: compute binary operation on two W32 values
+/// Highly optimized with direct heap access
+inline fn reduce_opy_w32(opy: Term, w32: Term) Term {
+    HVM.itrs += 1;
     const opy_loc = term_loc(opy);
     const t = term_tag(w32);
-    const x: u32 = @truncate(term_loc(got(opy_loc + 1)));
+    const x: u32 = @truncate(HVM.heap[opy_loc + 1] >> LOC_SHIFT);
     const y: u32 = @truncate(term_loc(w32));
+    const op = term_lab(opy);
 
-    const result: u32 = switch (term_lab(opy)) {
+    const result: u32 = switch (op) {
         OP_ADD => x +% y,
         OP_SUB => x -% y,
         OP_MUL => x *% y,
         OP_DIV => if (y != 0) x / y else 0,
         OP_MOD => if (y != 0) x % y else 0,
-        OP_EQ => if (x == y) 1 else 0,
-        OP_NE => if (x != y) 1 else 0,
-        OP_LT => if (x < y) 1 else 0,
-        OP_GT => if (x > y) 1 else 0,
-        OP_LTE => if (x <= y) 1 else 0,
-        OP_GTE => if (x >= y) 1 else 0,
+        OP_EQ => @intFromBool(x == y),
+        OP_NE => @intFromBool(x != y),
+        OP_LT => @intFromBool(x < y),
+        OP_GT => @intFromBool(x > y),
+        OP_LTE => @intFromBool(x <= y),
+        OP_GTE => @intFromBool(x >= y),
         OP_AND => x & y,
         OP_OR => x | y,
         OP_XOR => x ^ y,
@@ -849,8 +883,9 @@ pub fn reduce_opy_w32(opy: Term, w32: Term) Term {
 // Reference Expansion
 // =============================================================================
 
-pub fn reduce_ref(ref: Term) Term {
-    inc_itr();
+/// Expand function reference to its body
+inline fn reduce_ref(ref: Term) Term {
+    HVM.itrs += 1;
     const lab = term_lab(ref);
     if (HVM.book[lab]) |func| {
         return func(ref);
@@ -864,11 +899,12 @@ pub fn reduce_ref(ref: Term) Term {
 // Let Binding
 // =============================================================================
 
-pub fn reduce_let(let_term: Term, val: Term) Term {
-    inc_itr();
+/// Let binding: let x = val in body -> body[x := val]
+inline fn reduce_let(let_term: Term, val: Term) Term {
+    HVM.itrs += 1;
     const let_loc = term_loc(let_term);
-    const bod = got(let_loc + 1);
-    sub(let_loc + 0, val);
+    const bod = HVM.heap[let_loc + 1];
+    HVM.heap[let_loc] = val | SUB_MASK;
     return bod;
 }
 

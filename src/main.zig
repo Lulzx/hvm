@@ -360,14 +360,16 @@ fn run_tests() void {
 fn run_benchmark() void {
     print("\nRunning benchmark...\n", .{});
 
-    const iterations: u32 = 100000;
+    // Benchmark 1: Arithmetic operations
+    print("\n1. Arithmetic benchmark (100K ops):\n", .{});
+    const arith_iterations: u32 = 100000;
     var timer = std.time.Timer.start() catch {
         print("Timer not available\n", .{});
         return;
     };
 
     var i: u32 = 0;
-    while (i < iterations) : (i += 1) {
+    while (i < arith_iterations) : (i += 1) {
         const op_loc = hvm.alloc_node(2);
         hvm.set(op_loc + 0, hvm.term_new(hvm.W32, 0, i));
         hvm.set(op_loc + 1, hvm.term_new(hvm.W32, 0, i + 1));
@@ -375,13 +377,56 @@ fn run_benchmark() void {
         _ = hvm.reduce(opx);
     }
 
-    const elapsed = timer.read();
-    const elapsed_ms = @as(f64, @floatFromInt(elapsed)) / 1_000_000.0;
-
-    print("\nBenchmark results:\n", .{});
-    print("  Iterations: {d}\n", .{iterations});
+    var elapsed = timer.read();
+    var elapsed_ms = @as(f64, @floatFromInt(elapsed)) / 1_000_000.0;
     print("  Time: {d:.2} ms\n", .{elapsed_ms});
-    print("  Ops/sec: {d:.0}\n", .{@as(f64, @floatFromInt(iterations)) / (elapsed_ms / 1000.0)});
+    print("  Ops/sec: {d:.0}\n", .{@as(f64, @floatFromInt(arith_iterations)) / (elapsed_ms / 1000.0)});
+
+    // Benchmark 2: Beta reduction (lambda applications)
+    print("\n2. Beta reduction benchmark (100K apps):\n", .{});
+    hvm.set_len(1);
+    hvm.set_itr(0);
+    timer.reset();
+
+    i = 0;
+    while (i < arith_iterations) : (i += 1) {
+        // Create (λx.x) i - identity application
+        const lam_loc = hvm.alloc_node(1);
+        hvm.set(lam_loc, hvm.term_new(hvm.VAR, 0, lam_loc));
+        const app_loc = hvm.alloc_node(2);
+        hvm.set(app_loc, hvm.term_new(hvm.LAM, 0, lam_loc));
+        hvm.set(app_loc + 1, hvm.term_new(hvm.W32, 0, i));
+        _ = hvm.reduce(hvm.term_new(hvm.APP, 0, app_loc));
+    }
+
+    elapsed = timer.read();
+    elapsed_ms = @as(f64, @floatFromInt(elapsed)) / 1_000_000.0;
+    print("  Time: {d:.2} ms\n", .{elapsed_ms});
+    print("  Ops/sec: {d:.0}\n", .{@as(f64, @floatFromInt(arith_iterations)) / (elapsed_ms / 1000.0)});
+
+    // Benchmark 3: DUP+SUP annihilation
+    print("\n3. DUP+SUP annihilation benchmark (100K ops):\n", .{});
+    hvm.set_len(1);
+    hvm.set_itr(0);
+    timer.reset();
+
+    i = 0;
+    while (i < arith_iterations) : (i += 1) {
+        // Create !0{a,b} = &0{1,2}; a
+        const sup_loc = hvm.alloc_node(2);
+        hvm.set(sup_loc, hvm.term_new(hvm.W32, 0, 1));
+        hvm.set(sup_loc + 1, hvm.term_new(hvm.W32, 0, 2));
+        const dup_loc = hvm.alloc_node(1);
+        hvm.set(dup_loc, hvm.term_new(hvm.SUP, 0, sup_loc));
+        _ = hvm.reduce(hvm.term_new(hvm.DP0, 0, dup_loc));
+    }
+
+    elapsed = timer.read();
+    elapsed_ms = @as(f64, @floatFromInt(elapsed)) / 1_000_000.0;
+    print("  Time: {d:.2} ms\n", .{elapsed_ms});
+    print("  Ops/sec: {d:.0}\n", .{@as(f64, @floatFromInt(arith_iterations)) / (elapsed_ms / 1000.0)});
+
+    print("\n", .{});
     hvm.show_stats();
 }
 
