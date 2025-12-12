@@ -1191,149 +1191,292 @@ pub fn LOG_f(ref: Term) Term {
 }
 
 // =============================================================================
-// Reduce (WHNF Evaluation)
+// Reduce (WHNF Evaluation) - Heavily optimized following VictorTaelin's IC
 // =============================================================================
 
-pub fn reduce(term: Term) Term {
-    const stop: u64 = HVM.spos;
+/// WHNF reduction with cached pointers and inlined hot paths
+/// Based on optimizations from https://gist.github.com/VictorTaelin/4f55a8a07be9bd9f6d828227675fa9ac
+pub noinline fn reduce(term: Term) Term {
+    // Cache heap/stack pointers in locals (register allocation hint)
+    const heap = HVM.heap;
+    const stack = HVM.sbuf;
+    const stop = HVM.spos;
+    var spos = stop;
+    var itrs = HVM.itrs;
     var next: Term = term;
 
     while (true) {
-        var tag = term_tag(next);
-        var lab = term_lab(next);
-        var loc = term_loc(next);
-
-        // Handle substitution
-        if (term_get_bit(next) == 1) {
-            next = term_rem_bit(next);
-            tag = term_tag(next);
-            lab = term_lab(next);
-            loc = term_loc(next);
-            next = got(loc);
+        // Handle substitution bit (variable was bound)
+        if ((next & SUB_MASK) != 0) {
+            @branchHint(.likely);
+            const loc = (next >> LOC_SHIFT) & LOC_MASK;
+            next = heap[loc];
             continue;
         }
 
+        const tag: Tag = @truncate(next & TAG_MASK);
+        const loc = (next >> LOC_SHIFT) & LOC_MASK;
+
         switch (tag) {
-            // Variables resolve to their substitution
             VAR => {
-                next = got(loc);
-                if (term_get_bit(next) == 1) {
-                    next = term_rem_bit(next);
+                next = heap[loc];
+                if ((next & SUB_MASK) != 0) {
+                    @branchHint(.likely);
+                    next = next & ~SUB_MASK;
                     continue;
                 }
-                if (HVM.spos > stop) {
-                    const prev = spop();
-                    const p_loc = term_loc(prev);
-                    set(p_loc, next);
+                if (spos > stop) {
+                    spos -= 1;
+                    const prev = stack[spos];
+                    heap[(prev >> LOC_SHIFT) & LOC_MASK] = next;
                     next = prev;
                 } else {
                     break;
                 }
             },
 
-            // Dup projections
             DP0, DP1 => {
-                const val = got(loc);
-                if (term_get_bit(val) == 1) {
-                    next = reduce_dup_sub(next, term_rem_bit(val));
+                const val = heap[loc];
+                if ((val & SUB_MASK) != 0) {
+                    @branchHint(.likely);
+                    // Inlined reduce_dup_sub
+                    if (tag == DP0) {
+                        next = val & ~SUB_MASK;
+                    } else {
+                        const stored = heap[loc];
+                        if ((stored & SUB_MASK) != 0) {
+                            next = stored & ~SUB_MASK;
+                        } else {
+                            heap[loc] = (val & ~SUB_MASK) | SUB_MASK;
+                            next = val & ~SUB_MASK;
+                        }
+                    }
                     continue;
                 }
-                spush(next);
+                stack[spos] = next;
+                spos += 1;
                 next = val;
             },
 
-            // Reference expansion
             REF => {
+                HVM.spos = spos;
+                HVM.itrs = itrs;
                 next = reduce_ref(next);
+                spos = HVM.spos;
+                itrs = HVM.itrs;
             },
 
-            // Eliminators (APP, MAT, OPX, OPY) - push and reduce scrutinee
-            APP, MAT, IFL, SWI, OPX, OPY => {
-                spush(next);
-                next = got(loc);
+            APP, MAT, IFL, SWI, OPX, OPY, LET => {
+                stack[spos] = next;
+                spos += 1;
+                next = heap[loc];
             },
 
-            // LET
-            LET => {
-                spush(next);
-                next = got(loc);
-            },
-
-            // Values (LAM, SUP, CTR, ERA, W32, CHR) - interact or return
             LAM, SUP, CTR, ERA, W32, CHR => {
-                if (HVM.spos > stop) {
-                    const prev = spop();
-                    const p_tag = term_tag(prev);
-                    const p_loc = term_loc(prev);
-
-                    // Update the eliminator's scrutinee location
-                    set(p_loc, next);
-
-                    switch (p_tag) {
-                        APP => {
-                            switch (tag) {
-                                LAM => next = reduce_app_lam(prev, next),
-                                ERA => next = reduce_app_era(prev, next),
-                                SUP => next = reduce_app_sup(prev, next),
-                                CTR => next = reduce_app_ctr(prev, next),
-                                W32 => next = reduce_app_w32(prev, next),
-                                else => break,
-                            }
-                        },
-                        DP0, DP1 => {
-                            switch (tag) {
-                                ERA => next = reduce_dup_era(prev, next),
-                                LAM => next = reduce_dup_lam(prev, next),
-                                SUP => next = reduce_dup_sup(prev, next),
-                                CTR => next = reduce_dup_ctr(prev, next),
-                                W32, CHR => next = reduce_dup_w32(prev, next),
-                                else => break,
-                            }
-                        },
-                        MAT, IFL, SWI => {
-                            switch (tag) {
-                                ERA => next = reduce_mat_era(prev, next),
-                                LAM => next = reduce_mat_lam(prev, next),
-                                SUP => next = reduce_mat_sup(prev, next),
-                                CTR => next = reduce_mat_ctr(prev, next),
-                                W32, CHR => next = reduce_mat_w32(prev, next),
-                                else => break,
-                            }
-                        },
-                        OPX => {
-                            switch (tag) {
-                                ERA => next = reduce_opx_era(prev, next),
-                                LAM => next = reduce_opx_lam(prev, next),
-                                SUP => next = reduce_opx_sup(prev, next),
-                                CTR => next = reduce_opx_ctr(prev, next),
-                                W32, CHR => next = reduce_opx_w32(prev, next),
-                                else => break,
-                            }
-                        },
-                        OPY => {
-                            switch (tag) {
-                                ERA => next = reduce_opy_era(prev, next),
-                                LAM => next = reduce_opy_lam(prev, next),
-                                SUP => next = reduce_opy_sup(prev, next),
-                                CTR => next = reduce_opy_ctr(prev, next),
-                                W32, CHR => next = reduce_opy_w32(prev, next),
-                                else => break,
-                            }
-                        },
-                        LET => {
-                            next = reduce_let(prev, next);
-                        },
-                        else => break,
-                    }
-                } else {
+                if (spos <= stop) {
+                    @branchHint(.unlikely);
                     break;
                 }
+
+                spos -= 1;
+                const prev = stack[spos];
+                const p_tag: Tag = @truncate(prev & TAG_MASK);
+                const p_loc = (prev >> LOC_SHIFT) & LOC_MASK;
+
+                heap[p_loc] = next;
+
+                // APP-LAM: Most common interaction - fully inlined
+                if (p_tag == APP and tag == LAM) {
+                    @branchHint(.likely);
+                    itrs += 1;
+                    const arg = heap[p_loc + 1];
+                    const bod = heap[loc];
+                    heap[loc] = arg | SUB_MASK;
+                    next = bod;
+                    continue;
+                }
+
+                // DUP-SUP annihilation: Critical for optimal sharing - fully inlined
+                if ((p_tag == DP0 or p_tag == DP1) and tag == SUP) {
+                    const dup_lab: Lab = @truncate((prev >> LAB_SHIFT) & LAB_MASK);
+                    const sup_lab: Lab = @truncate((next >> LAB_SHIFT) & LAB_MASK);
+
+                    if (dup_lab == sup_lab) {
+                        @branchHint(.likely);
+                        itrs += 1;
+                        const tm0 = heap[loc];
+                        const tm1 = heap[loc + 1];
+                        const dup_loc = (prev >> LOC_SHIFT) & LOC_MASK;
+
+                        if (p_tag == DP0) {
+                            heap[dup_loc] = tm1 | SUB_MASK;
+                            next = tm0;
+                        } else {
+                            heap[dup_loc] = tm0 | SUB_MASK;
+                            next = tm1;
+                        }
+                        continue;
+                    }
+                }
+
+                // DUP-W32: Common case - inlined
+                if ((p_tag == DP0 or p_tag == DP1) and (tag == W32 or tag == CHR)) {
+                    @branchHint(.likely);
+                    itrs += 1;
+                    const dup_loc = (prev >> LOC_SHIFT) & LOC_MASK;
+                    heap[dup_loc] = next | SUB_MASK;
+                    continue;
+                }
+
+                // DUP-ERA: inlined
+                if ((p_tag == DP0 or p_tag == DP1) and tag == ERA) {
+                    itrs += 1;
+                    const dup_loc = (prev >> LOC_SHIFT) & LOC_MASK;
+                    heap[dup_loc] = next | SUB_MASK;
+                    continue;
+                }
+
+                // APP-ERA: inlined
+                if (p_tag == APP and tag == ERA) {
+                    itrs += 1;
+                    continue;
+                }
+
+                // OPX-W32: First operand ready, convert to OPY - inlined
+                if (p_tag == OPX and (tag == W32 or tag == CHR)) {
+                    @branchHint(.likely);
+                    itrs += 1;
+                    const opx_lab: Lab = @truncate((prev >> LAB_SHIFT) & LAB_MASK);
+                    const nmy = heap[p_loc + 1];
+                    heap[p_loc] = nmy;
+                    heap[p_loc + 1] = next;
+                    next = term_new(OPY, opx_lab, p_loc);
+                    continue;
+                }
+
+                // OPY-W32: Both operands ready, compute result - inlined
+                if (p_tag == OPY and (tag == W32 or tag == CHR)) {
+                    @branchHint(.likely);
+                    itrs += 1;
+                    const op: Lab = @truncate((prev >> LAB_SHIFT) & LAB_MASK);
+                    const t = tag;
+                    const x: u32 = @truncate(heap[p_loc + 1] >> LOC_SHIFT);
+                    const y: u32 = @truncate(loc);
+
+                    const result: u32 = switch (op) {
+                        OP_ADD => x +% y,
+                        OP_SUB => x -% y,
+                        OP_MUL => x *% y,
+                        OP_DIV => if (y != 0) x / y else 0,
+                        OP_MOD => if (y != 0) x % y else 0,
+                        OP_EQ => @intFromBool(x == y),
+                        OP_NE => @intFromBool(x != y),
+                        OP_LT => @intFromBool(x < y),
+                        OP_GT => @intFromBool(x > y),
+                        OP_LTE => @intFromBool(x <= y),
+                        OP_GTE => @intFromBool(x >= y),
+                        OP_AND => x & y,
+                        OP_OR => x | y,
+                        OP_XOR => x ^ y,
+                        OP_LSH => x << @truncate(y),
+                        OP_RSH => x >> @truncate(y),
+                        else => 0,
+                    };
+                    next = term_new(t, 0, result);
+                    continue;
+                }
+
+                // Restore state for non-inlined interactions
+                HVM.spos = spos;
+                HVM.itrs = itrs;
+
+                switch (p_tag) {
+                    APP => {
+                        switch (tag) {
+                            SUP => next = reduce_app_sup(prev, next),
+                            CTR => next = reduce_app_ctr(prev, next),
+                            W32 => next = reduce_app_w32(prev, next),
+                            else => {
+                                HVM.spos = spos;
+                                HVM.itrs = itrs;
+                                return next;
+                            },
+                        }
+                    },
+                    DP0, DP1 => {
+                        switch (tag) {
+                            LAM => next = reduce_dup_lam(prev, next),
+                            SUP => next = reduce_dup_sup(prev, next),
+                            CTR => next = reduce_dup_ctr(prev, next),
+                            else => {
+                                HVM.spos = spos;
+                                HVM.itrs = itrs;
+                                return next;
+                            },
+                        }
+                    },
+                    MAT, IFL, SWI => {
+                        switch (tag) {
+                            ERA => next = reduce_mat_era(prev, next),
+                            LAM => next = reduce_mat_lam(prev, next),
+                            SUP => next = reduce_mat_sup(prev, next),
+                            CTR => next = reduce_mat_ctr(prev, next),
+                            W32, CHR => next = reduce_mat_w32(prev, next),
+                            else => {
+                                HVM.spos = spos;
+                                HVM.itrs = itrs;
+                                return next;
+                            },
+                        }
+                    },
+                    OPX => {
+                        switch (tag) {
+                            ERA => next = reduce_opx_era(prev, next),
+                            LAM => next = reduce_opx_lam(prev, next),
+                            SUP => next = reduce_opx_sup(prev, next),
+                            CTR => next = reduce_opx_ctr(prev, next),
+                            W32, CHR => next = reduce_opx_w32(prev, next),
+                            else => {
+                                HVM.spos = spos;
+                                HVM.itrs = itrs;
+                                return next;
+                            },
+                        }
+                    },
+                    OPY => {
+                        switch (tag) {
+                            ERA => next = reduce_opy_era(prev, next),
+                            LAM => next = reduce_opy_lam(prev, next),
+                            SUP => next = reduce_opy_sup(prev, next),
+                            CTR => next = reduce_opy_ctr(prev, next),
+                            W32, CHR => next = reduce_opy_w32(prev, next),
+                            else => {
+                                HVM.spos = spos;
+                                HVM.itrs = itrs;
+                                return next;
+                            },
+                        }
+                    },
+                    LET => {
+                        next = reduce_let(prev, next);
+                    },
+                    else => {
+                        HVM.spos = spos;
+                        HVM.itrs = itrs;
+                        return next;
+                    },
+                }
+
+                spos = HVM.spos;
+                itrs = HVM.itrs;
             },
 
             else => break,
         }
     }
 
+    HVM.spos = spos;
+    HVM.itrs = itrs;
     return next;
 }
 

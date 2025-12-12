@@ -69,23 +69,25 @@ Result: #42
 
 ## Performance
 
-The implementation is heavily optimized for speed with:
-- Inlined hot paths and direct memory access
+The implementation is heavily optimized for speed following [VictorTaelin's IC optimization techniques](https://gist.github.com/VictorTaelin/4f55a8a07be9bd9f6d828227675fa9ac):
+- Cached heap/stack pointers in CPU registers
+- Branch prediction hints (`@branchHint`) for hot paths
+- Inlined critical interactions (APP-LAM, DUP-SUP, OPX-W32, OPY-W32) directly in reduce loop
 - Compile-time debug check removal in release builds
-- SIMD vectorized batch operations
+- SIMD vectorized batch operations (4-wide vectors)
 - Multi-threaded parallel execution (12 cores on M4 Pro)
 
 ### Benchmark Results (ReleaseFast, Apple M4 Pro)
 
 | Benchmark | Ops/sec | Notes |
 |-----------|---------|-------|
-| Single-threaded arithmetic | 109M | Traditional reduce() |
-| Beta reduction (λ application) | 145M | Traditional reduce() |
-| DUP+SUP annihilation | 157M | Traditional reduce() |
-| SIMD batch add | 1.4B | Vectorized, single-thread |
-| SIMD batch multiply | 3.8B | Vectorized, single-thread |
-| **Parallel SIMD add** | **13.9B** | **127x speedup** |
-| **Parallel SIMD multiply** | **14.7B** | Multi-threaded + SIMD |
+| Single-threaded arithmetic | 125M | Optimized reduce() |
+| Beta reduction (λ application) | 185M | Inlined APP-LAM |
+| DUP+SUP annihilation | 186M | Inlined in reduce loop |
+| SIMD batch add | 1.2B | Vectorized, single-thread |
+| SIMD batch multiply | 3.3B | Vectorized, single-thread |
+| **Parallel SIMD add** | **10.1B** | **81x speedup** |
+| **Parallel SIMD multiply** | **12.2B** | Multi-threaded + SIMD |
 
 ### Batch Operations API
 
