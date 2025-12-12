@@ -1400,6 +1400,144 @@ fn run_benchmark() void {
     print("  Time: {d:.2} ms\n", .{@as(f64, @floatFromInt(beta_chain_result.ns)) / 1_000_000.0});
     print("  Ops/sec: {d:.0}\n", .{beta_chain_ops_sec});
 
+    // =========================================================================
+    // METAL GPU BENCHMARKS (macOS only)
+    // =========================================================================
+
+    var gpu_add_ops_sec: f64 = 0;
+    var gpu_mul_ops_sec: f64 = 0;
+    var gpu_heap_ops_sec: f64 = 0;
+
+    if (metal.is_supported and metal.isAvailable()) {
+        print("\n--- Metal GPU Benchmarks ---\n", .{});
+
+        metal.init() catch {
+            print("\nMetal init failed, skipping GPU benchmarks\n", .{});
+        };
+        defer metal.deinit();
+
+        if (metal.getGPU()) |gpu| {
+            print("\nGPU Device: {s}\n", .{gpu.getDeviceName()});
+
+            // Benchmark 28: GPU vs CPU batch add
+            print("\n28. Metal GPU batch add (10M ops):\n", .{});
+            const gpu_a = allocator.alloc(u32, batch_iterations) catch {
+                print("  Allocation failed\n", .{});
+                return;
+            };
+            defer allocator.free(gpu_a);
+            const gpu_b = allocator.alloc(u32, batch_iterations) catch {
+                print("  Allocation failed\n", .{});
+                return;
+            };
+            defer allocator.free(gpu_b);
+            const gpu_results = allocator.alloc(u32, batch_iterations) catch {
+                print("  Allocation failed\n", .{});
+                return;
+            };
+            defer allocator.free(gpu_results);
+
+            for (0..batch_iterations) |j| {
+                gpu_a[j] = @intCast(j);
+                gpu_b[j] = @intCast(j + 1);
+            }
+
+            // CPU SIMD baseline
+            timer.reset();
+            metal.cpuBatchAdd(gpu_a, gpu_b, gpu_results);
+            const cpu_add_ns = timer.read();
+            const cpu_add_ms = @as(f64, @floatFromInt(cpu_add_ns)) / 1_000_000.0;
+            const cpu_add_ops = @as(f64, @floatFromInt(batch_iterations)) / (cpu_add_ms / 1000.0);
+            print("  CPU SIMD: {d:.2} ms ({d:.0} ops/sec)\n", .{ cpu_add_ms, cpu_add_ops });
+
+            // GPU batch add (currently uses CPU fallback, but measures the path)
+            timer.reset();
+            metal.batchAdd(gpu_a, gpu_b, gpu_results);
+            const gpu_add_ns = timer.read();
+            const gpu_add_ms = @as(f64, @floatFromInt(gpu_add_ns)) / 1_000_000.0;
+            gpu_add_ops_sec = @as(f64, @floatFromInt(batch_iterations)) / (gpu_add_ms / 1000.0);
+            print("  GPU path: {d:.2} ms ({d:.0} ops/sec)\n", .{ gpu_add_ms, gpu_add_ops_sec });
+
+            // Benchmark 29: GPU vs CPU batch multiply
+            print("\n29. Metal GPU batch multiply (10M ops):\n", .{});
+
+            timer.reset();
+            metal.cpuBatchMul(gpu_a, gpu_b, gpu_results);
+            const cpu_mul_ns = timer.read();
+            const cpu_mul_ms = @as(f64, @floatFromInt(cpu_mul_ns)) / 1_000_000.0;
+            const cpu_mul_ops = @as(f64, @floatFromInt(batch_iterations)) / (cpu_mul_ms / 1000.0);
+            print("  CPU SIMD: {d:.2} ms ({d:.0} ops/sec)\n", .{ cpu_mul_ms, cpu_mul_ops });
+
+            timer.reset();
+            metal.batchMul(gpu_a, gpu_b, gpu_results);
+            const gpu_mul_ns = timer.read();
+            const gpu_mul_ms = @as(f64, @floatFromInt(gpu_mul_ns)) / 1_000_000.0;
+            gpu_mul_ops_sec = @as(f64, @floatFromInt(batch_iterations)) / (gpu_mul_ms / 1000.0);
+            print("  GPU path: {d:.2} ms ({d:.0} ops/sec)\n", .{ gpu_mul_ms, gpu_mul_ops_sec });
+
+            // Benchmark 30: GPU heap transfer
+            print("\n30. Metal GPU heap transfer (1M terms):\n", .{});
+            const heap_size: usize = 1_000_000;
+            gpu.allocHeap(heap_size) catch {
+                print("  GPU heap alloc failed\n", .{});
+                return;
+            };
+            defer gpu.freeHeap();
+
+            const heap_data = allocator.alloc(u64, heap_size) catch {
+                print("  Allocation failed\n", .{});
+                return;
+            };
+            defer allocator.free(heap_data);
+
+            for (0..heap_size) |j| {
+                heap_data[j] = hvm.term_new(hvm.NUM, 0, @truncate(j));
+            }
+
+            // Upload
+            timer.reset();
+            gpu.uploadHeap(heap_data) catch {
+                print("  Upload failed\n", .{});
+                return;
+            };
+            const upload_ns = timer.read();
+            const upload_ms = @as(f64, @floatFromInt(upload_ns)) / 1_000_000.0;
+            print("  Upload: {d:.2} ms ({d:.0} terms/sec)\n", .{ upload_ms, @as(f64, @floatFromInt(heap_size)) / (upload_ms / 1000.0) });
+
+            // Download
+            const download_data = allocator.alloc(u64, heap_size) catch {
+                print("  Allocation failed\n", .{});
+                return;
+            };
+            defer allocator.free(download_data);
+
+            timer.reset();
+            gpu.downloadHeap(download_data) catch {
+                print("  Download failed\n", .{});
+                return;
+            };
+            const download_ns = timer.read();
+            const download_ms = @as(f64, @floatFromInt(download_ns)) / 1_000_000.0;
+            print("  Download: {d:.2} ms ({d:.0} terms/sec)\n", .{ download_ms, @as(f64, @floatFromInt(heap_size)) / (download_ms / 1000.0) });
+
+            // Combined throughput
+            const total_ns = upload_ns + download_ns;
+            const total_ms = @as(f64, @floatFromInt(total_ns)) / 1_000_000.0;
+            gpu_heap_ops_sec = @as(f64, @floatFromInt(heap_size * 2)) / (total_ms / 1000.0);
+            print("  Round-trip: {d:.2} ms ({d:.0} terms/sec)\n", .{ total_ms, gpu_heap_ops_sec });
+
+            // Verify data integrity
+            var matches: usize = 0;
+            for (0..heap_size) |j| {
+                if (download_data[j] == heap_data[j]) matches += 1;
+            }
+            print("  Verified: {d}/{d} terms match\n", .{ matches, heap_size });
+        }
+    } else {
+        print("\n--- Metal GPU Benchmarks ---\n", .{});
+        print("\nMetal not available on this platform\n", .{});
+    }
+
     // Calculate speedups (use benchmark 3 serial beta reduction as baseline)
     print("\n--- Performance Summary ---\n", .{});
     print("Serial beta baseline: {d:.0} ops/sec\n", .{single_ops_sec});
@@ -1411,6 +1549,13 @@ fn run_benchmark() void {
     print("  SIMD interactions: {d:.1}x\n", .{simd_int_ops_sec / single_ops_sec});
     print("  Pure parallel: {d:.1}x\n", .{parallel_pure_ops_sec / single_ops_sec});
     print("  Supercombinators: {d:.1}x\n", .{sc_ops_sec / single_ops_sec});
+
+    if (gpu_add_ops_sec > 0) {
+        print("\nMetal GPU:\n", .{});
+        print("  Batch add: {d:.1}x\n", .{gpu_add_ops_sec / single_ops_sec});
+        print("  Batch mul: {d:.1}x\n", .{gpu_mul_ops_sec / single_ops_sec});
+        print("  Heap transfer: {d:.0} terms/sec\n", .{gpu_heap_ops_sec});
+    }
 
     print("\n", .{});
     hvm.show_stats();
