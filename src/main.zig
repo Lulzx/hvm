@@ -4,26 +4,49 @@ const parser = @import("parser.zig");
 const print = std.debug.print;
 
 // =============================================================================
+// Term Display
+// =============================================================================
+
+fn show_term(term: hvm.Term) void {
+    const tag = hvm.term_tag(term);
+    const ext = hvm.term_ext(term);
+    const val = hvm.term_val(term);
+
+    switch (tag) {
+        hvm.ERA => print("*", .{}),
+        hvm.NUM => print("#{d}", .{val}),
+        hvm.LAM => print("LAM({d})", .{val}),
+        hvm.APP => print("APP({d})", .{val}),
+        hvm.SUP => print("SUP({d},{d})", .{ ext, val }),
+        hvm.CO0 => print("CO0({d},{d})", .{ ext, val }),
+        hvm.CO1 => print("CO1({d},{d})", .{ ext, val }),
+        hvm.VAR => print("VAR({d})", .{val}),
+        hvm.REF => print("REF({d},{d})", .{ ext, val }),
+        else => print("?{d}({d},{d})", .{ tag, ext, val }),
+    }
+}
+
+// =============================================================================
 // Example Programs
 // =============================================================================
 
 // Example: Identity function (lambda x. x)
 fn identity() void {
     const lam_loc = hvm.alloc_node(1);
-    hvm.set(lam_loc, hvm.term_new(hvm.VAR, 0, lam_loc));
+    hvm.set(lam_loc, hvm.term_new(hvm.VAR, 0, @truncate(lam_loc)));
 
     const app_loc = hvm.alloc_node(2);
-    hvm.set(app_loc + 0, hvm.term_new(hvm.LAM, 0, lam_loc));
-    hvm.set(app_loc + 1, hvm.term_new(hvm.W32, 0, 42));
+    hvm.set(app_loc + 0, hvm.term_new(hvm.LAM, 0, @truncate(lam_loc)));
+    hvm.set(app_loc + 1, hvm.term_new(hvm.NUM, 0, 42));
 
-    const app = hvm.term_new(hvm.APP, 0, app_loc);
+    const app = hvm.term_new(hvm.APP, 0, @truncate(app_loc));
 
     print("Example: Identity function\n", .{});
     print("  Input: (lambda x. x) 42\n", .{});
 
     const result = hvm.reduce(app);
     print("  Result: ", .{});
-    hvm.show_term(result);
+    show_term(result);
     print("\n", .{});
 }
 
@@ -31,18 +54,18 @@ fn identity() void {
 fn constant_fn() void {
     const inner_lam_loc = hvm.alloc_node(1);
     const outer_lam_loc = hvm.alloc_node(1);
-    hvm.set(outer_lam_loc, hvm.term_new(hvm.LAM, 0, inner_lam_loc));
-    hvm.set(inner_lam_loc, hvm.term_new(hvm.VAR, 0, outer_lam_loc));
+    hvm.set(outer_lam_loc, hvm.term_new(hvm.LAM, 0, @truncate(inner_lam_loc)));
+    hvm.set(inner_lam_loc, hvm.term_new(hvm.VAR, 0, @truncate(outer_lam_loc)));
 
     const app1_loc = hvm.alloc_node(2);
-    hvm.set(app1_loc + 0, hvm.term_new(hvm.LAM, 0, outer_lam_loc));
-    hvm.set(app1_loc + 1, hvm.term_new(hvm.W32, 0, 1));
+    hvm.set(app1_loc + 0, hvm.term_new(hvm.LAM, 0, @truncate(outer_lam_loc)));
+    hvm.set(app1_loc + 1, hvm.term_new(hvm.NUM, 0, 1));
 
     const app2_loc = hvm.alloc_node(2);
-    hvm.set(app2_loc + 0, hvm.term_new(hvm.APP, 0, app1_loc));
-    hvm.set(app2_loc + 1, hvm.term_new(hvm.W32, 0, 2));
+    hvm.set(app2_loc + 0, hvm.term_new(hvm.APP, 0, @truncate(app1_loc)));
+    hvm.set(app2_loc + 1, hvm.term_new(hvm.NUM, 0, 2));
 
-    const app = hvm.term_new(hvm.APP, 0, app2_loc);
+    const app = hvm.term_new(hvm.APP, 0, @truncate(app2_loc));
 
     print("\nExample: Constant function\n", .{});
     print("  Input: ((lambda x. lambda y. x) 1) 2\n", .{});
@@ -50,45 +73,45 @@ fn constant_fn() void {
 
     const result = hvm.reduce(app);
     print("  Result: ", .{});
-    hvm.show_term(result);
+    show_term(result);
     print("\n", .{});
 }
 
 // Example: Arithmetic (3 + 4)
 fn arithmetic() void {
     const op_loc = hvm.alloc_node(2);
-    hvm.set(op_loc + 0, hvm.term_new(hvm.W32, 0, 3));
-    hvm.set(op_loc + 1, hvm.term_new(hvm.W32, 0, 4));
+    hvm.set(op_loc + 0, hvm.term_new(hvm.NUM, 0, 3));
+    hvm.set(op_loc + 1, hvm.term_new(hvm.NUM, 0, 4));
 
-    const opx = hvm.term_new(hvm.OPX, hvm.OP_ADD, op_loc);
+    const op = hvm.term_new(hvm.P02, hvm.OP_ADD, @truncate(op_loc));
 
     print("\nExample: Arithmetic\n", .{});
     print("  Input: 3 + 4\n", .{});
 
-    const result = hvm.reduce(opx);
+    const result = hvm.reduce(op);
     print("  Result: ", .{});
-    hvm.show_term(result);
+    show_term(result);
     print("\n", .{});
 }
 
 // Example: Superposition and duplication
 fn superposition() void {
     const sup_loc = hvm.alloc_node(2);
-    hvm.set(sup_loc + 0, hvm.term_new(hvm.W32, 0, 1));
-    hvm.set(sup_loc + 1, hvm.term_new(hvm.W32, 0, 2));
+    hvm.set(sup_loc + 0, hvm.term_new(hvm.NUM, 0, 1));
+    hvm.set(sup_loc + 1, hvm.term_new(hvm.NUM, 0, 2));
 
     const dup_loc = hvm.alloc_node(1);
-    hvm.set(dup_loc + 0, hvm.term_new(hvm.SUP, 0, sup_loc));
+    hvm.set(dup_loc + 0, hvm.term_new(hvm.SUP, 0, @truncate(sup_loc)));
 
-    const dp0 = hvm.term_new(hvm.DP0, 0, dup_loc);
+    const co0 = hvm.term_new(hvm.CO0, 0, @truncate(dup_loc));
 
     print("\nExample: Superposition\n", .{});
     print("  Input: !0{{a, b}} = {{1, 2}}; a\n", .{});
     print("  Expected: 1\n", .{});
 
-    const result = hvm.reduce(dp0);
+    const result = hvm.reduce(co0);
     print("  Result: ", .{});
-    hvm.show_term(result);
+    show_term(result);
     print("\n", .{});
 }
 
@@ -98,10 +121,10 @@ fn erasure() void {
     hvm.set(lam_loc, hvm.term_new(hvm.ERA, 0, 0));
 
     const app_loc = hvm.alloc_node(2);
-    hvm.set(app_loc + 0, hvm.term_new(hvm.LAM, 0, lam_loc));
-    hvm.set(app_loc + 1, hvm.term_new(hvm.W32, 0, 42));
+    hvm.set(app_loc + 0, hvm.term_new(hvm.LAM, 0, @truncate(lam_loc)));
+    hvm.set(app_loc + 1, hvm.term_new(hvm.NUM, 0, 42));
 
-    const app = hvm.term_new(hvm.APP, 0, app_loc);
+    const app = hvm.term_new(hvm.APP, 0, @truncate(app_loc));
 
     print("\nExample: Erasure\n", .{});
     print("  Input: (lambda x. *) 42\n", .{});
@@ -109,7 +132,7 @@ fn erasure() void {
 
     const result = hvm.reduce(app);
     print("  Result: ", .{});
-    hvm.show_term(result);
+    show_term(result);
     print("\n", .{});
 }
 
@@ -117,7 +140,7 @@ fn erasure() void {
 fn all_operators() void {
     print("\nExample: All arithmetic operators\n", .{});
 
-    const ops = [_]struct { op: hvm.Lab, name: []const u8, a: u32, b: u32, expected: u32 }{
+    const ops = [_]struct { op: hvm.Ext, name: []const u8, a: u32, b: u32, expected: u32 }{
         .{ .op = hvm.OP_ADD, .name = "+", .a = 10, .b = 3, .expected = 13 },
         .{ .op = hvm.OP_SUB, .name = "-", .a = 10, .b = 3, .expected = 7 },
         .{ .op = hvm.OP_MUL, .name = "*", .a = 10, .b = 3, .expected = 30 },
@@ -136,12 +159,12 @@ fn all_operators() void {
 
     for (ops) |op_info| {
         const op_loc = hvm.alloc_node(2);
-        hvm.set(op_loc + 0, hvm.term_new(hvm.W32, 0, op_info.a));
-        hvm.set(op_loc + 1, hvm.term_new(hvm.W32, 0, op_info.b));
+        hvm.set(op_loc + 0, hvm.term_new(hvm.NUM, 0, op_info.a));
+        hvm.set(op_loc + 1, hvm.term_new(hvm.NUM, 0, op_info.b));
 
-        const opx = hvm.term_new(hvm.OPX, op_info.op, op_loc);
-        const result = hvm.reduce(opx);
-        const result_val = hvm.term_loc(result);
+        const p = hvm.term_new(hvm.P02, op_info.op, @truncate(op_loc));
+        const result = hvm.reduce(p);
+        const result_val = hvm.term_val(result);
 
         const status = if (result_val == op_info.expected) "OK" else "FAIL";
         print("  {d} {s} {d} = {d} [{s}]\n", .{ op_info.a, op_info.name, op_info.b, result_val, status });
@@ -155,7 +178,7 @@ fn all_operators() void {
 fn test_parser(allocator: std.mem.Allocator) !void {
     print("\n=== Parser Tests ===\n\n", .{});
 
-    const tests = [_]struct { name: []const u8, code: []const u8, expected: ?u64 }{
+    const tests = [_]struct { name: []const u8, code: []const u8, expected: ?u32 }{
         .{ .name = "Number", .code = "#42", .expected = 42 },
         .{ .name = "Erasure", .code = "*", .expected = null },
         .{ .name = "Character", .code = "'x'", .expected = null },
@@ -181,7 +204,7 @@ fn test_parser(allocator: std.mem.Allocator) !void {
         };
 
         const result = hvm.reduce(term);
-        const result_val = hvm.term_loc(result);
+        const result_val = hvm.term_val(result);
 
         if (t.expected) |exp| {
             if (result_val == exp) {
@@ -192,7 +215,7 @@ fn test_parser(allocator: std.mem.Allocator) !void {
             }
         } else {
             print("  {s}: {s} => ", .{ t.name, t.code });
-            hvm.show_term(result);
+            show_term(result);
             print(" [OK]\n", .{});
             passed += 1;
         }
@@ -237,7 +260,7 @@ fn run_file(allocator: std.mem.Allocator, path: []const u8) !void {
     // Print result
     print("Result: ", .{});
     const pretty_result = parser.pretty(allocator, result) catch {
-        hvm.show_term(result);
+        show_term(result);
         print("\n", .{});
         return;
     };
@@ -246,7 +269,7 @@ fn run_file(allocator: std.mem.Allocator, path: []const u8) !void {
 
     print("---\n", .{});
     print("Time: {d} us\n", .{end - start});
-    print("Interactions: {d}\n", .{hvm.get_itr()});
+    print("Interactions: {d}\n", .{hvm.get_itrs()});
 }
 
 // =============================================================================
@@ -262,7 +285,7 @@ fn run_eval(allocator: std.mem.Allocator, code: []const u8) !void {
     const result = hvm.reduce(term);
 
     const pretty_result = parser.pretty(allocator, result) catch {
-        hvm.show_term(result);
+        show_term(result);
         print("\n", .{});
         return;
     };
@@ -377,10 +400,10 @@ fn run_benchmark() void {
     var i: u32 = 0;
     while (i < iterations) : (i += 1) {
         const op_loc = hvm.alloc_node(2);
-        hvm.set(op_loc + 0, hvm.term_new(hvm.W32, 0, i));
-        hvm.set(op_loc + 1, hvm.term_new(hvm.W32, 0, i + 1));
-        const opx = hvm.term_new(hvm.OPX, hvm.OP_ADD, op_loc);
-        _ = hvm.reduce(opx);
+        hvm.set(op_loc + 0, hvm.term_new(hvm.NUM, 0, i));
+        hvm.set(op_loc + 1, hvm.term_new(hvm.NUM, 0, i + 1));
+        const op = hvm.term_new(hvm.P02, hvm.OP_ADD, @truncate(op_loc));
+        _ = hvm.reduce(op);
     }
 
     var elapsed = timer.read();
@@ -432,11 +455,11 @@ fn run_benchmark() void {
     i = 0;
     while (i < iterations) : (i += 1) {
         const lam_loc = hvm.alloc_node(1);
-        hvm.set(lam_loc, hvm.term_new(hvm.VAR, 0, lam_loc));
+        hvm.set(lam_loc, hvm.term_new(hvm.VAR, 0, @truncate(lam_loc)));
         const app_loc = hvm.alloc_node(2);
-        hvm.set(app_loc, hvm.term_new(hvm.LAM, 0, lam_loc));
-        hvm.set(app_loc + 1, hvm.term_new(hvm.W32, 0, i));
-        _ = hvm.reduce(hvm.term_new(hvm.APP, 0, app_loc));
+        hvm.set(app_loc, hvm.term_new(hvm.LAM, 0, @truncate(lam_loc)));
+        hvm.set(app_loc + 1, hvm.term_new(hvm.NUM, 0, i));
+        _ = hvm.reduce(hvm.term_new(hvm.APP, 0, @truncate(app_loc)));
     }
 
     elapsed = timer.read();
@@ -444,8 +467,8 @@ fn run_benchmark() void {
     print("  Time: {d:.2} ms\n", .{elapsed_ms});
     print("  Ops/sec: {d:.0}\n", .{@as(f64, @floatFromInt(iterations)) / (elapsed_ms / 1000.0)});
 
-    // Benchmark 4: DUP+SUP annihilation
-    print("\n4. DUP+SUP annihilation (100K ops):\n", .{});
+    // Benchmark 4: CO0+SUP annihilation
+    print("\n4. CO0+SUP annihilation (100K ops):\n", .{});
     hvm.set_len(1);
     hvm.set_itr(0);
     timer.reset();
@@ -453,11 +476,11 @@ fn run_benchmark() void {
     i = 0;
     while (i < iterations) : (i += 1) {
         const sup_loc = hvm.alloc_node(2);
-        hvm.set(sup_loc, hvm.term_new(hvm.W32, 0, 1));
-        hvm.set(sup_loc + 1, hvm.term_new(hvm.W32, 0, 2));
+        hvm.set(sup_loc, hvm.term_new(hvm.NUM, 0, 1));
+        hvm.set(sup_loc + 1, hvm.term_new(hvm.NUM, 0, 2));
         const dup_loc = hvm.alloc_node(1);
-        hvm.set(dup_loc, hvm.term_new(hvm.SUP, 0, sup_loc));
-        _ = hvm.reduce(hvm.term_new(hvm.DP0, 0, dup_loc));
+        hvm.set(dup_loc, hvm.term_new(hvm.SUP, 0, @truncate(sup_loc)));
+        _ = hvm.reduce(hvm.term_new(hvm.CO0, 0, @truncate(dup_loc)));
     }
 
     elapsed = timer.read();
@@ -543,12 +566,13 @@ fn print_help() void {
 test "term operations" {
     const term = hvm.term_new(hvm.LAM, 42, 12345);
     try std.testing.expectEqual(hvm.LAM, hvm.term_tag(term));
-    try std.testing.expectEqual(@as(hvm.Lab, 42), hvm.term_lab(term));
-    try std.testing.expectEqual(@as(u64, 12345), hvm.term_loc(term));
+    try std.testing.expectEqual(@as(hvm.Ext, 42), hvm.term_ext(term));
+    try std.testing.expectEqual(@as(hvm.Val, 12345), hvm.term_val(term));
 }
 
-test "term is atom" {
-    try std.testing.expect(hvm.term_is_atom(hvm.term_new(hvm.ERA, 0, 0)));
-    try std.testing.expect(hvm.term_is_atom(hvm.term_new(hvm.W32, 0, 42)));
-    try std.testing.expect(!hvm.term_is_atom(hvm.term_new(hvm.LAM, 0, 0)));
+test "term is value" {
+    try std.testing.expect(hvm.term_is_val(hvm.term_new(hvm.ERA, 0, 0)));
+    try std.testing.expect(hvm.term_is_val(hvm.term_new(hvm.NUM, 0, 42)));
+    try std.testing.expect(hvm.term_is_val(hvm.term_new(hvm.LAM, 0, 0)));
+    try std.testing.expect(!hvm.term_is_val(hvm.term_new(hvm.APP, 0, 0)));
 }

@@ -184,7 +184,7 @@ pub const Parser = struct {
         return val;
     }
 
-    fn parseOp(self: *Parser) ?hvm.Lab {
+    fn parseOp(self: *Parser) ?hvm.Ext {
         self.skip();
         if (self.pos >= self.text.len) return null;
 
@@ -201,11 +201,11 @@ pub const Parser = struct {
             }
             if (std.mem.eql(u8, two, "<=")) {
                 self.pos += 2;
-                return hvm.OP_LTE;
+                return hvm.OP_LE;
             }
             if (std.mem.eql(u8, two, ">=")) {
                 self.pos += 2;
-                return hvm.OP_GTE;
+                return hvm.OP_GE;
             }
             if (std.mem.eql(u8, two, "<<")) {
                 self.pos += 2;
@@ -259,7 +259,7 @@ pub const Parser = struct {
             return hvm.term_new(hvm.ERA, 0, 0);
         }
 
-        // Number or Constructor: #123 or #Name{...}
+        // Number or Constructor: #123 or #Name{fields}
         if (c == '#') {
             self.pos += 1;
             const next = self.peek() orelse return ParseError.UnexpectedEof;
@@ -281,25 +281,27 @@ pub const Parser = struct {
                     try self.consume('}');
                 }
 
-                // Allocate constructor on heap
-                const loc = hvm.alloc_node(fields.items.len);
+                // Allocate constructor on heap - use C00-C15 based on arity
+                const arity = fields.items.len;
+                const ctr_tag: hvm.Tag = @truncate(hvm.C00 + @min(arity, 15));
+                const loc = hvm.alloc_node(arity);
                 for (fields.items, 0..) |field, i| {
                     hvm.set(loc + i, field);
                 }
-                return hvm.term_new(hvm.CTR, 0, loc); // TODO: proper constructor label
+                return hvm.term_new(ctr_tag, 0, @truncate(loc));
             }
 
             // Number: #123
             const val = try self.integer();
-            return hvm.term_new(hvm.W32, 0, val);
+            return hvm.term_new(hvm.NUM, 0, val);
         }
 
-        // Character: 'c'
+        // Character: 'c' (characters are numbers in HVM4)
         if (c == '\'') {
             self.pos += 1;
             const chr = self.advance() orelse return ParseError.UnexpectedEof;
             try self.consume('\'');
-            return hvm.term_new(hvm.CHR, 0, chr);
+            return hvm.term_new(hvm.NUM, 0, chr);
         }
 
         // Lambda: λx.body or \x.body
@@ -325,7 +327,7 @@ pub const Parser = struct {
             // Set lambda body
             hvm.set(lam_loc, body);
 
-            return hvm.term_new(hvm.LAM, 0, lam_loc);
+            return hvm.term_new(hvm.LAM, 0, @truncate(lam_loc));
         }
 
         // Function reference: @name(args...)
@@ -360,8 +362,8 @@ pub const Parser = struct {
                 for (args.items, 0..) |arg, i| {
                     hvm.set(loc + i, arg);
                 }
-                hvm.hvm_get_state().fari[func.fid] = @intCast(args.items.len);
-                return hvm.term_new(hvm.REF, func.fid, loc);
+                hvm.hvm_get_state().fun_arity[func.fid] = @intCast(args.items.len);
+                return hvm.term_new(hvm.REF, func.fid, @truncate(loc));
             } else {
                 return ParseError.UndefinedFunction;
             }
@@ -415,7 +417,7 @@ pub const Parser = struct {
                 hvm.set(loc + 1 + i, case_term);
             }
 
-            return hvm.term_new(hvm.MAT, @intCast(cases.items.len), loc);
+            return hvm.term_new(hvm.MAT, @intCast(cases.items.len), @truncate(loc));
         }
 
         // Parentheses: operator, switch, or application
@@ -437,7 +439,7 @@ pub const Parser = struct {
                 hvm.set(loc + 1, zero);
                 hvm.set(loc + 2, succ);
 
-                return hvm.term_new(hvm.SWI, 2, loc);
+                return hvm.term_new(hvm.SWI, 2, @truncate(loc));
             }
 
             // Check for binary operator
@@ -446,12 +448,12 @@ pub const Parser = struct {
                 const b = try self.term();
                 try self.consume(')');
 
-                // Allocate OPX node
+                // Allocate binary primitive node (P02 = arity 2 primitive)
                 const loc = hvm.alloc_node(2);
                 hvm.set(loc, a);
                 hvm.set(loc + 1, b);
 
-                return hvm.term_new(hvm.OPX, op, loc);
+                return hvm.term_new(hvm.P02, op, @truncate(loc));
             }
 
             // Application: (f x y z)
@@ -464,7 +466,7 @@ pub const Parser = struct {
                 const loc = hvm.alloc_node(2);
                 hvm.set(loc, fun);
                 hvm.set(loc + 1, arg);
-                fun = hvm.term_new(hvm.APP, 0, loc);
+                fun = hvm.term_new(hvm.APP, 0, @truncate(loc));
             }
             try self.consume(')');
             return fun;
@@ -473,7 +475,7 @@ pub const Parser = struct {
         // Superposition: &L{a, b}
         if (c == '&') {
             self.pos += 1;
-            const lab: u16 = if (self.peek()) |pc|
+            const lab: hvm.Ext = if (self.peek()) |pc|
                 (if (pc >= '0' and pc <= '9') @truncate(try self.integer()) else 0)
             else
                 0;
@@ -488,14 +490,14 @@ pub const Parser = struct {
             hvm.set(loc, a);
             hvm.set(loc + 1, b);
 
-            return hvm.term_new(hvm.SUP, lab, loc);
+            return hvm.term_new(hvm.SUP, lab, @truncate(loc));
         }
 
         // Duplication: !&L{x,y}=val;body
         if (c == '!') {
             self.pos += 1;
             try self.consume('&');
-            const lab: u16 = if (self.peek()) |pc|
+            const lab: hvm.Ext = if (self.peek()) |pc|
                 (if (pc >= '0' and pc <= '9') @truncate(try self.integer()) else 0)
             else
                 0;
@@ -512,12 +514,12 @@ pub const Parser = struct {
             const dup_loc = hvm.alloc_node(1);
             hvm.set(dup_loc, val);
 
-            // Bind x to DP0, y to DP1
+            // Bind x to CO0, y to CO1
             try self.bindVar(x, dup_loc);
             try self.bindVar(y, dup_loc);
 
             // Store which projection each variable uses
-            // We'll handle this by creating the DP0/DP1 terms when variables are used
+            // We'll handle this by creating the CO0/CO1 terms when variables are used
 
             // Parse body with bindings
             const body = try self.termWithDupBindings(x, y, lab, dup_loc);
@@ -529,7 +531,7 @@ pub const Parser = struct {
         if (isNameStart(c)) {
             const var_name = try self.name();
             if (self.lookupVar(var_name)) |loc| {
-                return hvm.term_new(hvm.VAR, 0, loc);
+                return hvm.term_new(hvm.VAR, 0, @truncate(loc));
             }
             return ParseError.UndefinedVariable;
         }
@@ -537,8 +539,8 @@ pub const Parser = struct {
         return ParseError.UnexpectedChar;
     }
 
-    // Parse term with dup bindings - replaces x with DP0 and y with DP1
-    fn termWithDupBindings(self: *Parser, x: []const u8, y: []const u8, lab: u16, dup_loc: u64) ParseError!hvm.Term {
+    // Parse term with dup bindings - replaces x with CO0 and y with CO1
+    fn termWithDupBindings(self: *Parser, x: []const u8, y: []const u8, lab: hvm.Ext, dup_loc: u64) ParseError!hvm.Term {
         const c = self.peek() orelse return ParseError.UnexpectedEof;
 
         // Check if it's a variable that matches x or y
@@ -547,10 +549,10 @@ pub const Parser = struct {
             const var_name = try self.name();
 
             if (std.mem.eql(u8, var_name, x)) {
-                return hvm.term_new(hvm.DP0, lab, dup_loc);
+                return hvm.term_new(hvm.CO0, lab, @truncate(dup_loc));
             }
             if (std.mem.eql(u8, var_name, y)) {
-                return hvm.term_new(hvm.DP1, lab, dup_loc);
+                return hvm.term_new(hvm.CO1, lab, @truncate(dup_loc));
             }
 
             // Not x or y, restore and parse normally
@@ -573,7 +575,7 @@ pub const Parser = struct {
         hvm.set(loc + 1, tm0);
         hvm.set(loc + 2, tm1);
 
-        return hvm.term_new(hvm.REF, hvm.SUP_F, loc);
+        return hvm.term_new(hvm.REF, hvm.SUP_F, @truncate(loc));
     }
 
     fn parseBuiltinDUP(self: *Parser) ParseError!hvm.Term {
@@ -588,7 +590,7 @@ pub const Parser = struct {
         hvm.set(loc + 1, val);
         hvm.set(loc + 2, bod);
 
-        return hvm.term_new(hvm.REF, hvm.DUP_F, loc);
+        return hvm.term_new(hvm.REF, hvm.DUP_F, @truncate(loc));
     }
 
     // Parse a function definition: @name(params) = body
@@ -739,7 +741,7 @@ pub const Parser = struct {
 var func_bodies: [65536]hvm.Term = [_]hvm.Term{0} ** 65536;
 
 fn funcDispatch(ref: hvm.Term) hvm.Term {
-    const fid = hvm.term_lab(ref);
+    const fid = hvm.term_ext(ref);
     const body = func_bodies[fid];
 
     // For now, just return the body
@@ -795,37 +797,36 @@ pub fn pretty(allocator: Allocator, term: hvm.Term) ![]const u8 {
 
 fn prettyInto(allocator: Allocator, buf: *ArrayList(u8), term: hvm.Term) !void {
     const tag = hvm.term_tag(term);
-    const lab = hvm.term_lab(term);
-    const loc = hvm.term_loc(term);
+    const ext = hvm.term_ext(term);
+    const val = hvm.term_val(term);
 
     switch (tag) {
         hvm.ERA => try buf.appendSlice(allocator, "*"),
-        hvm.W32 => try std.fmt.format(buf.writer(allocator), "#{d}", .{loc}),
-        hvm.CHR => try std.fmt.format(buf.writer(allocator), "'{c}'", .{@as(u8, @truncate(loc))}),
+        hvm.NUM => try std.fmt.format(buf.writer(allocator), "#{d}", .{val}),
         hvm.LAM => {
             try buf.appendSlice(allocator, "\\_."); // Use ASCII backslash instead of λ
-            try prettyInto(allocator, buf, hvm.got(loc));
+            try prettyInto(allocator, buf, hvm.got(val));
         },
         hvm.APP => {
             try buf.append(allocator, '(');
-            try prettyInto(allocator, buf, hvm.got(loc));
+            try prettyInto(allocator, buf, hvm.got(val));
             try buf.append(allocator, ' ');
-            try prettyInto(allocator, buf, hvm.got(loc + 1));
+            try prettyInto(allocator, buf, hvm.got(val + 1));
             try buf.append(allocator, ')');
         },
         hvm.SUP => {
-            try std.fmt.format(buf.writer(allocator), "&{d}{{", .{lab});
-            try prettyInto(allocator, buf, hvm.got(loc));
+            try std.fmt.format(buf.writer(allocator), "&{d}{{", .{ext});
+            try prettyInto(allocator, buf, hvm.got(val));
             try buf.append(allocator, ',');
-            try prettyInto(allocator, buf, hvm.got(loc + 1));
+            try prettyInto(allocator, buf, hvm.got(val + 1));
             try buf.append(allocator, '}');
         },
-        hvm.DP0 => try std.fmt.format(buf.writer(allocator), "DP0({d},{d})", .{ lab, loc }),
-        hvm.DP1 => try std.fmt.format(buf.writer(allocator), "DP1({d},{d})", .{ lab, loc }),
-        hvm.VAR => try std.fmt.format(buf.writer(allocator), "VAR({d})", .{loc}),
-        hvm.REF => try std.fmt.format(buf.writer(allocator), "@{d}", .{lab}),
-        hvm.OPX, hvm.OPY => {
-            const op_str: []const u8 = switch (lab) {
+        hvm.CO0 => try std.fmt.format(buf.writer(allocator), "CO0({d},{d})", .{ ext, val }),
+        hvm.CO1 => try std.fmt.format(buf.writer(allocator), "CO1({d},{d})", .{ ext, val }),
+        hvm.VAR => try std.fmt.format(buf.writer(allocator), "VAR({d})", .{val}),
+        hvm.REF => try std.fmt.format(buf.writer(allocator), "@{d}", .{ext}),
+        hvm.P02, hvm.F_OP2 => {
+            const op_str: []const u8 = switch (ext) {
                 hvm.OP_ADD => "+",
                 hvm.OP_SUB => "-",
                 hvm.OP_MUL => "*",
@@ -835,8 +836,8 @@ fn prettyInto(allocator: Allocator, buf: *ArrayList(u8), term: hvm.Term) !void {
                 hvm.OP_NE => "!=",
                 hvm.OP_LT => "<",
                 hvm.OP_GT => ">",
-                hvm.OP_LTE => "<=",
-                hvm.OP_GTE => ">=",
+                hvm.OP_LE => "<=",
+                hvm.OP_GE => ">=",
                 hvm.OP_AND => "&",
                 hvm.OP_OR => "|",
                 hvm.OP_XOR => "^",
@@ -847,28 +848,36 @@ fn prettyInto(allocator: Allocator, buf: *ArrayList(u8), term: hvm.Term) !void {
             try buf.append(allocator, '(');
             try buf.appendSlice(allocator, op_str);
             try buf.append(allocator, ' ');
-            try prettyInto(allocator, buf, hvm.got(loc));
+            try prettyInto(allocator, buf, hvm.got(val));
             try buf.append(allocator, ' ');
-            try prettyInto(allocator, buf, hvm.got(loc + 1));
+            try prettyInto(allocator, buf, hvm.got(val + 1));
             try buf.append(allocator, ')');
         },
         hvm.SWI => {
             try buf.appendSlice(allocator, "(?");
-            try prettyInto(allocator, buf, hvm.got(loc));
+            try prettyInto(allocator, buf, hvm.got(val));
             try buf.append(allocator, ' ');
-            try prettyInto(allocator, buf, hvm.got(loc + 1));
+            try prettyInto(allocator, buf, hvm.got(val + 1));
             try buf.append(allocator, ' ');
-            try prettyInto(allocator, buf, hvm.got(loc + 2));
+            try prettyInto(allocator, buf, hvm.got(val + 2));
             try buf.append(allocator, ')');
-        },
-        hvm.CTR => {
-            try std.fmt.format(buf.writer(allocator), "#CTR{d}{{", .{lab});
-            // TODO: print fields based on arity
-            try buf.appendSlice(allocator, "...}");
         },
         hvm.MAT => {
             try buf.appendSlice(allocator, "~...");
         },
-        else => try std.fmt.format(buf.writer(allocator), "?{d}({d},{d})", .{ tag, lab, loc }),
+        else => {
+            // Handle constructors C00-C15
+            if (tag >= hvm.C00 and tag <= hvm.C15) {
+                const arity = hvm.ctr_arity(tag);
+                try std.fmt.format(buf.writer(allocator), "#C{d}{{", .{ext});
+                for (0..arity) |i| {
+                    if (i > 0) try buf.append(allocator, ',');
+                    try prettyInto(allocator, buf, hvm.got(val + i));
+                }
+                try buf.append(allocator, '}');
+            } else {
+                try std.fmt.format(buf.writer(allocator), "?{d}({d},{d})", .{ tag, ext, val });
+            }
+        },
     }
 }
