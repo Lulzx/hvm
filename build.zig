@@ -18,7 +18,7 @@ pub fn build(b: *std.Build) void {
     }
 
     const exe = b.addExecutable(.{
-        .name = "hvm3",
+        .name = "hvm4",
         .root_module = exe_module,
     });
 
@@ -31,7 +31,7 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
-    const run_step = b.step("run", "Run the HVM3 runtime");
+    const run_step = b.step("run", "Run the HVM4 runtime");
     run_step.dependOn(&run_cmd.step);
 
     const unit_tests = b.addTest(.{

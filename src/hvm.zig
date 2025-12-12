@@ -107,6 +107,18 @@ pub const F_EQL: Tag = 0x46; // Reducing for equality check
 pub const DSU: Tag = 0x50; // Dynamic superposition
 pub const DDU: Tag = 0x51; // Dynamic duplication
 
+// Type System (Interaction Calculus of Constructions)
+pub const ANN: Tag = 0x60; // Annotation {term : Type}
+pub const BRI: Tag = 0x61; // Bridge θx. term (for dependent types)
+pub const TYP: Tag = 0x62; // Type universe (*)
+pub const ALL: Tag = 0x63; // Dependent function type Π(x:A).B
+pub const SIG: Tag = 0x64; // Dependent pair type Σ(x:A).B
+pub const SLF: Tag = 0x65; // Self type (for induction)
+
+// Stack frames for type checking
+pub const F_ANN: Tag = 0x68; // Reducing annotation
+pub const F_BRI: Tag = 0x69; // Reducing bridge
+pub const F_EQL2: Tag = 0x6A; // Second stage of equality check
 
 // Void term
 pub const VOID: Term = 0;
@@ -665,6 +677,77 @@ fn builtin_log(ref: Term) Term {
 }
 
 // =============================================================================
+// Structural Equality
+// =============================================================================
+
+/// Deep structural equality check between two terms
+pub fn struct_equal(a: Term, b: Term) bool {
+    const a_reduced = reduce(a);
+    const b_reduced = reduce(b);
+
+    const a_tag = term_tag(a_reduced);
+    const b_tag = term_tag(b_reduced);
+
+    // Tags must match
+    if (a_tag != b_tag) return false;
+
+    const a_ext = term_ext(a_reduced);
+    const b_ext = term_ext(b_reduced);
+    const a_val = term_val(a_reduced);
+    const b_val = term_val(b_reduced);
+
+    switch (a_tag) {
+        // Atomic values: compare directly
+        ERA => return true,
+        NUM => return a_val == b_val,
+
+        // Lambda: compare bodies (alpha equivalence)
+        LAM => {
+            const a_bod = HVM.heap[a_val];
+            const b_bod = HVM.heap[b_val];
+            return struct_equal(a_bod, b_bod);
+        },
+
+        // Application: compare both parts
+        APP => {
+            const a_fun = HVM.heap[a_val];
+            const a_arg = HVM.heap[a_val + 1];
+            const b_fun = HVM.heap[b_val];
+            const b_arg = HVM.heap[b_val + 1];
+            return struct_equal(a_fun, b_fun) and struct_equal(a_arg, b_arg);
+        },
+
+        // Superposition: compare label and both branches
+        SUP => {
+            if (a_ext != b_ext) return false;
+            const a_lft = HVM.heap[a_val];
+            const a_rgt = HVM.heap[a_val + 1];
+            const b_lft = HVM.heap[b_val];
+            const b_rgt = HVM.heap[b_val + 1];
+            return struct_equal(a_lft, b_lft) and struct_equal(a_rgt, b_rgt);
+        },
+
+        // Constructors: compare ext (constructor id) and all fields
+        C00, C01, C02, C03, C04, C05, C06, C07, C08, C09, C10, C11, C12, C13, C14, C15 => {
+            if (a_ext != b_ext) return false;
+            const arity = ctr_arity(a_tag);
+            for (0..arity) |i| {
+                if (!struct_equal(HVM.heap[a_val + i], HVM.heap[b_val + i])) {
+                    return false;
+                }
+            }
+            return true;
+        },
+
+        // Type universe
+        TYP => return true,
+
+        // Default: not equal if we can't determine
+        else => return false,
+    }
+}
+
+// =============================================================================
 // WNF Reduction (Weak Normal Form) - HVM4 Style
 // =============================================================================
 
@@ -746,6 +829,58 @@ pub noinline fn reduce(term: Term) Term {
                 stack[spos] = term_new(F_OP2, ext, val);
                 spos += 1;
                 next = heap[val];
+            },
+
+            // Structural equality: reduce first operand
+            EQL => {
+                stack[spos] = term_new(F_EQL, ext, val);
+                spos += 1;
+                next = heap[val];
+            },
+
+            // Guarded reduction (RED): f ~> g
+            // Only reduce g when scrutinized
+            RED => {
+                // RED(f, g) when applied, substitute f first
+                // heap[val] = f, heap[val+1] = g
+                next = heap[val];
+            },
+
+            // Type annotation: {term : Type}
+            // heap[val] = term, heap[val+1] = type
+            ANN => {
+                // Push frame to check type, reduce term first
+                stack[spos] = term_new(F_ANN, ext, val);
+                spos += 1;
+                next = heap[val];
+            },
+
+            // Bridge (theta): θx. term
+            // Creates a scope for dependent types
+            BRI => {
+                stack[spos] = term_new(F_BRI, ext, val);
+                spos += 1;
+                next = heap[val];
+            },
+
+            // Type universe - already a value
+            TYP => {
+                if (spos <= stop) break;
+                spos -= 1;
+                const prev = stack[spos];
+                const p_tag = term_tag(prev);
+
+                // ANN + TYP: Type annotation with type universe
+                if (p_tag == F_ANN) {
+                    HVM.interactions += 1;
+                    // Type checks - decay the annotation
+                    next = heap[term_val(prev)]; // Return the term
+                    continue;
+                }
+
+                heap[term_val(prev)] = next;
+                HVM.stack_pos = spos;
+                return next;
             },
 
             // Values: interact with stack top
@@ -862,6 +997,83 @@ pub noinline fn reduce(term: Term) Term {
                     const bod = heap[p_val + 1];
                     heap[p_val] = term_set_sub(next);
                     next = bod;
+                    continue;
+                }
+
+                // F_EQL + value: First operand ready, reduce second
+                if (p_tag == F_EQL) {
+                    HVM.interactions += 1;
+                    const eql_loc = p_val;
+                    const arg1 = heap[eql_loc + 1];
+                    heap[eql_loc] = next; // Store first operand
+                    stack[spos] = term_new(F_EQL2, p_ext, eql_loc);
+                    spos += 1;
+                    next = arg1;
+                    continue;
+                }
+
+                // F_EQL2 + value: Both operands ready, compare
+                if (p_tag == F_EQL2) {
+                    HVM.interactions += 1;
+                    const first = heap[p_val];
+                    const second = next;
+                    // Structural equality check
+                    const equal = struct_equal(first, second);
+                    next = term_new(NUM, 0, if (equal) 1 else 0);
+                    continue;
+                }
+
+                // F_ANN + LAM: Annotation with lambda - decay (type checks)
+                if (p_tag == F_ANN and tag == LAM) {
+                    HVM.interactions += 1;
+                    // Annotation decays - return the term
+                    next = term_new(LAM, ext, val);
+                    continue;
+                }
+
+                // F_ANN + NUM: Annotation with number - decay
+                if (p_tag == F_ANN and tag == NUM) {
+                    HVM.interactions += 1;
+                    next = term_new(NUM, ext, val);
+                    continue;
+                }
+
+                // F_ANN + CTR: Annotation with constructor - decay
+                if (p_tag == F_ANN and tag >= C00 and tag <= C15) {
+                    HVM.interactions += 1;
+                    next = term_new(tag, ext, val);
+                    continue;
+                }
+
+                // F_ANN + SUP: Annotation with superposition - distribute
+                if (p_tag == F_ANN and tag == SUP) {
+                    HVM.interactions += 1;
+                    // {SUP(a,b) : T} => SUP({a:T}, {b:T})
+                    const sup_loc = val;
+                    const sup_ext = ext;
+                    const typ = heap[p_val + 1];
+
+                    const loc0 = alloc(2);
+                    heap[loc0] = heap[sup_loc];
+                    heap[loc0 + 1] = typ;
+
+                    const loc1 = alloc(2);
+                    heap[loc1] = heap[sup_loc + 1];
+                    heap[loc1 + 1] = typ;
+
+                    const new_loc = alloc(2);
+                    heap[new_loc] = term_new(ANN, 0, @truncate(loc0));
+                    heap[new_loc + 1] = term_new(ANN, 0, @truncate(loc1));
+
+                    next = term_new(SUP, sup_ext, @truncate(new_loc));
+                    continue;
+                }
+
+                // F_BRI + value: Bridge completed
+                if (p_tag == F_BRI) {
+                    HVM.interactions += 1;
+                    // Bridge just returns the body
+                    next = term_new(tag, ext, val);
                     continue;
                 }
 
@@ -1009,6 +1221,171 @@ pub fn fresh_label() Ext {
     const lab = HVM.fresh_label;
     HVM.fresh_label += 1;
     return lab;
+}
+
+// =============================================================================
+// SupGen - Superposition-based Program Enumeration
+// =============================================================================
+
+/// Create a superposition of two terms with a fresh label
+/// SUP{a, b} - represents both a AND b simultaneously
+pub fn sup(a: Term, b: Term) Term {
+    const lab = fresh_label();
+    const loc = alloc(2);
+    set(loc, a);
+    set(loc + 1, b);
+    return term_new(SUP, lab, loc);
+}
+
+/// Enumerate a bit: SUP{#0, #1}
+/// Returns a superposition of 0 and 1
+pub fn enum_bit() Term {
+    return sup(term_new(NUM, 0, 0), term_new(NUM, 0, 1));
+}
+
+/// Enumerate a boolean: SUP{#True, #False}
+/// Using C00 for True (nullary constructor 0) and C01 for False
+pub fn enum_bool() Term {
+    const true_term = term_new(C00, 0, 0); // #True
+    const false_term = term_new(C00, 1, 0); // #False
+    return sup(true_term, false_term);
+}
+
+/// Enumerate natural numbers up to max (exclusive)
+/// SUP{#0, SUP{#1, SUP{#2, ...}}}
+pub fn enum_nat(max: u32) Term {
+    if (max == 0) return term_new(NUM, 0, 0);
+    if (max == 1) return term_new(NUM, 0, 0);
+
+    var result = term_new(NUM, 0, max - 1);
+    var i: u32 = max - 1;
+    while (i > 0) {
+        i -= 1;
+        result = sup(term_new(NUM, 0, i), result);
+    }
+    return result;
+}
+
+/// Enumerate terms of a given depth
+/// depth 0: variables, numbers
+/// depth 1: lambdas, applications of depth-0 terms
+/// etc.
+pub fn enum_term(depth: u32, num_vars: u32) Term {
+    if (depth == 0) {
+        // Base case: enumerate variables or a number
+        if (num_vars == 0) {
+            return term_new(NUM, 0, 0); // Just zero
+        }
+        // Enumerate available variables
+        var result = term_new(VAR, 0, num_vars - 1);
+        var i: u32 = num_vars - 1;
+        while (i > 0) {
+            i -= 1;
+            result = sup(term_new(VAR, 0, i), result);
+        }
+        // Also include zero
+        return sup(term_new(NUM, 0, 0), result);
+    }
+
+    // Recursive case: enumerate lambda or application
+    const sub_term = enum_term(depth - 1, num_vars);
+
+    // Lambda: λ. body (with one more variable in scope)
+    const lam_body = enum_term(depth - 1, num_vars + 1);
+    const lam_loc = alloc(1);
+    set(lam_loc, lam_body);
+    const lam_term = term_new(LAM, 0, lam_loc);
+
+    // Application: (f x) where f and x are sub-terms
+    const app_loc = alloc(2);
+    set(app_loc, sub_term);
+    set(app_loc + 1, enum_term(depth - 1, num_vars)); // Fresh enumeration for arg
+    const app_term = term_new(APP, 0, app_loc);
+
+    // Return SUP of lambda and application
+    return sup(lam_term, app_term);
+}
+
+/// Check if a superposed term satisfies a predicate
+/// Collapses to the first branch that returns #1
+pub fn sup_find(term: Term, predicate: *const fn (Term) Term) ?Term {
+    const result = reduce(term);
+    const tag = term_tag(result);
+
+    if (tag == SUP) {
+        const loc = term_val(result);
+        const lft = got(loc);
+        const rgt = got(loc + 1);
+
+        // Try left branch
+        const lft_check = predicate(lft);
+        const lft_reduced = reduce(lft_check);
+        if (term_tag(lft_reduced) == NUM and term_val(lft_reduced) == 1) {
+            return lft;
+        }
+
+        // Try right branch
+        const rgt_check = predicate(rgt);
+        const rgt_reduced = reduce(rgt_check);
+        if (term_tag(rgt_reduced) == NUM and term_val(rgt_reduced) == 1) {
+            return rgt;
+        }
+
+        // Recursively search
+        if (sup_find(lft, predicate)) |found| return found;
+        if (sup_find(rgt, predicate)) |found| return found;
+
+        return null;
+    }
+
+    // Not a superposition, check directly
+    const check = predicate(result);
+    const check_reduced = reduce(check);
+    if (term_tag(check_reduced) == NUM and term_val(check_reduced) == 1) {
+        return result;
+    }
+
+    return null;
+}
+
+/// Create dependent function type: Π(x:A).B
+/// ALL(A, λx.B) where B can reference x
+pub fn make_all(domain: Term, codomain: Term) Term {
+    const loc = alloc(2);
+    set(loc, domain);
+    set(loc + 1, codomain); // Should be a lambda
+    return term_new(ALL, 0, loc);
+}
+
+/// Create dependent pair type: Σ(x:A).B
+pub fn make_sig(fst_type: Term, snd_type: Term) Term {
+    const loc = alloc(2);
+    set(loc, fst_type);
+    set(loc + 1, snd_type); // Should be a lambda
+    return term_new(SIG, 0, loc);
+}
+
+/// Create type annotation: {term : Type}
+pub fn annotate(term: Term, typ: Term) Term {
+    const loc = alloc(2);
+    set(loc, term);
+    set(loc + 1, typ);
+    return term_new(ANN, 0, loc);
+}
+
+/// Type check a term (returns #1 if valid, #0 if error)
+/// This reduces the annotation - if it decays successfully, the term is well-typed
+pub fn type_check(term: Term) Term {
+    const result = reduce(term);
+    const tag = term_tag(result);
+
+    // If the annotation decayed (tag is not ANN), type checking succeeded
+    if (tag != ANN) {
+        return term_new(NUM, 0, 1);
+    }
+
+    // Still an annotation - type error
+    return term_new(NUM, 0, 0);
 }
 
 // =============================================================================

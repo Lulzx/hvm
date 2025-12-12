@@ -1,6 +1,6 @@
 # HVM4 (Zig)
 
-A Zig implementation of HVM4 - the Higher-Order Virtual Machine based on Interaction Calculus. Upgraded from HVM3 with the new term layout and expanded type system.
+A Zig implementation of HVM4 - the Higher-Order Virtual Machine based on Interaction Calculus, with the new term layout, type system, and SupGen primitives.
 
 ## Features
 
@@ -11,6 +11,8 @@ A Zig implementation of HVM4 - the Higher-Order Virtual Machine based on Interac
 - **Lazy Collapse**: BFS enumeration of infinite superposition structures
 - **Auto-Dup Foundation**: Variable use counting and fresh label generation
 - **SIMD + Parallel**: Vectorized batch operations with multi-threaded execution
+- **Type System**: Annotations, structural equality, and type decay via interaction nets
+- **SupGen Primitives**: Superposition-based program enumeration for discrete search
 
 ## Building
 
@@ -28,22 +30,22 @@ zig build -Doptimize=ReleaseFast
 
 ```bash
 # Run an HVM file
-./zig-out/bin/hvm3 run examples/test.hvm
+./zig-out/bin/hvm4 run examples/test.hvm
 
 # Evaluate an expression
-./zig-out/bin/hvm3 eval "(+ #21 #21)"
+./zig-out/bin/hvm4 eval "(+ #21 #21)"
 
 # Run tests
-./zig-out/bin/hvm3 test
+./zig-out/bin/hvm4 test
 
 # Run parser tests
-./zig-out/bin/hvm3 parse
+./zig-out/bin/hvm4 parse
 
 # Run benchmarks
-./zig-out/bin/hvm3 bench
+./zig-out/bin/hvm4 bench
 
 # Show syntax examples
-./zig-out/bin/hvm3 examples
+./zig-out/bin/hvm4 examples
 ```
 
 ## Syntax
@@ -59,6 +61,9 @@ zig build -Doptimize=ReleaseFast
 | `&L{a,b}` | Superposition | `&0{#1,#2}` |
 | `!&L{x,y}=v;k` | Duplication | `!&0{a,b}=sup;a` |
 | `(?n z s)` | Switch/match | `(?#0 #100 \p.#200)` |
+| `{t : T}` | Type annotation | `{#42 : Type}` |
+| `(=== a b)` | Structural equality | `(=== #42 #42)` |
+| `Type` | Type universe | `Type` |
 
 ## Example
 
@@ -68,10 +73,10 @@ zig build -Doptimize=ReleaseFast
 ```
 
 ```bash
-$ ./zig-out/bin/hvm3 eval "(+ #21 #21)"
+$ ./zig-out/bin/hvm4 eval "(+ #21 #21)"
 #42
 
-$ ./zig-out/bin/hvm3 eval "(* (+ #2 #3) (- #10 #4))"
+$ ./zig-out/bin/hvm4 eval "(* (+ #2 #3) (- #10 #4))"
 #30
 ```
 
@@ -98,6 +103,7 @@ $ ./zig-out/bin/hvm3 eval "(* (+ #2 #3) (- #10 #4))"
 | Pattern Match | MAT, SWI | Constructor and numeric matching |
 | Stack Frames | F_APP, F_MAT, F_SWI, F_OP2, etc. | Evaluation frames |
 | Special | DUP, LET, USE, EQL, RED | Advanced features |
+| Type System | ANN, BRI, TYP, ALL, SIG, SLF | Type annotations and dependent types |
 
 ## Performance
 
@@ -141,7 +147,7 @@ hvm.parallel_batch_mul(a, b, results);
 
 Run benchmarks with:
 ```bash
-./zig-out/bin/hvm3 bench
+./zig-out/bin/hvm4 bench
 ```
 
 ## References

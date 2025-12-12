@@ -349,7 +349,7 @@ pub fn main() !void {
 
 fn print_banner() void {
     print("===========================================\n", .{});
-    print("HVM3 - Higher-Order Virtual Machine (Zig)\n", .{});
+    print("HVM4 - Higher-Order Virtual Machine (Zig)\n", .{});
     print("===========================================\n", .{});
 }
 
@@ -523,9 +523,9 @@ fn run_benchmark() void {
 
 fn print_help() void {
     const help =
-        \\HVM3 - Higher-Order Virtual Machine (Zig)
+        \\HVM4 - Higher-Order Virtual Machine (Zig)
         \\
-        \\Usage: hvm3 [command] [options]
+        \\Usage: hvm4 [command] [options]
         \\
         \\Commands:
         \\  <file.hvm>      Run an HVM file directly
@@ -547,13 +547,16 @@ fn print_help() void {
         \\  &L{a,b}       Superposition with label L
         \\  !&L{x,y}=v;k  Duplication
         \\  (?n z s)      Switch on number
+        \\  {t : T}       Type annotation
+        \\  (=== a b)     Structural equality
+        \\  Type          Type universe
         \\
         \\Examples:
-        \\  hvm3 example.hvm
-        \\  hvm3 eval "(+ #3 #4)"
-        \\  hvm3 bench
+        \\  hvm4 example.hvm
+        \\  hvm4 eval "(+ #3 #4)"
+        \\  hvm4 bench
         \\
-        \\For more information: https://github.com/HigherOrderCO/HVM3
+        \\For more information: https://github.com/HigherOrderCO/HVM
         \\
     ;
     print("{s}", .{help});

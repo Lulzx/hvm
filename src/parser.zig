@@ -184,9 +184,21 @@ pub const Parser = struct {
         return val;
     }
 
+    // Special operator for structural equality
+    const STRUCT_EQ: hvm.Ext = 0xFF;
+
     fn parseOp(self: *Parser) ?hvm.Ext {
         self.skip();
         if (self.pos >= self.text.len) return null;
+
+        // Check for three-char operators first (===)
+        if (self.pos + 2 < self.text.len) {
+            const three = self.text[self.pos .. self.pos + 3];
+            if (std.mem.eql(u8, three, "===")) {
+                self.pos += 3;
+                return STRUCT_EQ; // Structural equality marker
+            }
+        }
 
         // Check for two-char operators first
         if (self.pos + 1 < self.text.len) {
@@ -257,6 +269,31 @@ pub const Parser = struct {
         if (c == '*') {
             self.pos += 1;
             return hvm.term_new(hvm.ERA, 0, 0);
+        }
+
+        // Type annotation: {term : Type}
+        if (c == '{') {
+            self.pos += 1;
+            const inner_term = try self.term();
+            try self.consume(':');
+            const typ = try self.term();
+            try self.consume('}');
+
+            const loc = hvm.alloc_node(2);
+            hvm.set(loc, inner_term);
+            hvm.set(loc + 1, typ);
+            return hvm.term_new(hvm.ANN, 0, @truncate(loc));
+        }
+
+        // Type universe: Type
+        if (c == 'T' and self.pos + 4 <= self.text.len) {
+            if (std.mem.eql(u8, self.text[self.pos .. self.pos + 4], "Type")) {
+                // Make sure it's not part of a longer name
+                if (self.pos + 4 >= self.text.len or !isNameChar(self.text[self.pos + 4])) {
+                    self.pos += 4;
+                    return hvm.term_new(hvm.TYP, 0, 0);
+                }
+            }
         }
 
         // Number or Constructor: #123 or #Name{fields}
@@ -448,11 +485,17 @@ pub const Parser = struct {
                 const b = try self.term();
                 try self.consume(')');
 
-                // Allocate binary primitive node (P02 = arity 2 primitive)
+                // Allocate binary node
                 const loc = hvm.alloc_node(2);
                 hvm.set(loc, a);
                 hvm.set(loc + 1, b);
 
+                // Structural equality uses EQL tag
+                if (op == STRUCT_EQ) {
+                    return hvm.term_new(hvm.EQL, 0, @truncate(loc));
+                }
+
+                // Other operators use P02 (arity 2 primitive)
                 return hvm.term_new(hvm.P02, op, @truncate(loc));
             }
 
@@ -864,6 +907,50 @@ fn prettyInto(allocator: Allocator, buf: *ArrayList(u8), term: hvm.Term) !void {
         },
         hvm.MAT => {
             try buf.appendSlice(allocator, "~...");
+        },
+        hvm.EQL => {
+            try buf.appendSlice(allocator, "(=== ");
+            try prettyInto(allocator, buf, hvm.got(val));
+            try buf.append(allocator, ' ');
+            try prettyInto(allocator, buf, hvm.got(val + 1));
+            try buf.append(allocator, ')');
+        },
+        hvm.RED => {
+            try buf.appendSlice(allocator, "(~> ");
+            try prettyInto(allocator, buf, hvm.got(val));
+            try buf.append(allocator, ' ');
+            try prettyInto(allocator, buf, hvm.got(val + 1));
+            try buf.append(allocator, ')');
+        },
+        hvm.ANN => {
+            try buf.append(allocator, '{');
+            try prettyInto(allocator, buf, hvm.got(val));
+            try buf.appendSlice(allocator, " : ");
+            try prettyInto(allocator, buf, hvm.got(val + 1));
+            try buf.append(allocator, '}');
+        },
+        hvm.BRI => {
+            try buf.appendSlice(allocator, "θ_.");
+            try prettyInto(allocator, buf, hvm.got(val));
+        },
+        hvm.TYP => {
+            try buf.appendSlice(allocator, "Type");
+        },
+        hvm.ALL => {
+            try buf.appendSlice(allocator, "Π(");
+            try prettyInto(allocator, buf, hvm.got(val));
+            try buf.appendSlice(allocator, ").");
+            try prettyInto(allocator, buf, hvm.got(val + 1));
+        },
+        hvm.SIG => {
+            try buf.appendSlice(allocator, "Σ(");
+            try prettyInto(allocator, buf, hvm.got(val));
+            try buf.appendSlice(allocator, ").");
+            try prettyInto(allocator, buf, hvm.got(val + 1));
+        },
+        hvm.SLF => {
+            try buf.appendSlice(allocator, "Self.");
+            try prettyInto(allocator, buf, hvm.got(val));
         },
         else => {
             // Handle constructors C00-C15
