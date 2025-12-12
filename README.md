@@ -147,6 +147,7 @@ Run benchmarks with:
 ## References
 
 - [HVM4 Technical Overview](https://gist.github.com/VictorTaelin/71e9b2ffeba3a9402afba76f8735d0b8)
+- [HVM4 Commit History](https://gist.github.com/VictorTaelin/57d8082c7ffb97bd4755dd39815bd0cc)
 - [IC Optimization to C](https://gist.github.com/VictorTaelin/ab20d7ec33ba7395ddacab58079fe20c)
 - [VictorTaelin's X updates](https://x.com/VictorTaelin/status/1971591584916393984)
 
