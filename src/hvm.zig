@@ -793,6 +793,116 @@ pub fn struct_equal(a: Term, b: Term) bool {
 }
 
 // =============================================================================
+// Comptime Interaction Dispatch Table
+// =============================================================================
+
+/// Unified interaction function signature
+/// All interactions receive full context, use what they need
+const InteractFn = *const fn (p_val: Val, p_ext: Ext, val: Val, ext: Ext, p_tag: Tag, tag: Tag, next: Term) Term;
+
+/// Wrapper for APP + LAM
+fn wrap_app_lam(p_val: Val, _: Ext, val: Val, _: Ext, _: Tag, _: Tag, next: Term) Term {
+    HVM.heap[p_val] = next;
+    return interact_app_lam(p_val, val);
+}
+
+/// Wrapper for APP + ERA
+fn wrap_app_era(_: Val, _: Ext, _: Val, _: Ext, _: Tag, _: Tag, _: Term) Term {
+    return interact_app_era();
+}
+
+/// Wrapper for APP + SUP (needs stack sync - handled in reduce)
+fn wrap_app_sup(p_val: Val, _: Ext, val: Val, ext: Ext, _: Tag, _: Tag, _: Term) Term {
+    return interact_app_sup(p_val, val, ext);
+}
+
+/// Wrapper for CO0/CO1 + SUP
+fn wrap_dup_sup(p_val: Val, p_ext: Ext, val: Val, ext: Ext, p_tag: Tag, _: Tag, _: Term) Term {
+    return interact_dup_sup(p_tag, p_val, p_ext, val, ext);
+}
+
+/// Wrapper for CO0/CO1 + NUM
+fn wrap_dup_num(p_val: Val, _: Ext, _: Val, _: Ext, _: Tag, _: Tag, next: Term) Term {
+    return interact_dup_num(p_val, next);
+}
+
+/// Wrapper for CO0/CO1 + ERA
+fn wrap_dup_era(p_val: Val, _: Ext, _: Val, _: Ext, _: Tag, _: Tag, _: Term) Term {
+    return interact_dup_era(p_val);
+}
+
+/// Wrapper for CO0/CO1 + LAM (needs stack sync - handled in reduce)
+fn wrap_dup_lam(p_val: Val, p_ext: Ext, val: Val, _: Ext, p_tag: Tag, _: Tag, _: Term) Term {
+    return interact_dup_lam(p_tag, p_val, p_ext, val);
+}
+
+/// Wrapper for CO0/CO1 + CTR (needs stack sync - handled in reduce)
+fn wrap_dup_ctr(p_val: Val, p_ext: Ext, val: Val, ext: Ext, p_tag: Tag, tag: Tag, _: Term) Term {
+    return interact_dup_ctr(p_tag, p_val, p_ext, tag, val, ext);
+}
+
+/// Wrapper for MAT + CTR (needs stack sync - handled in reduce)
+fn wrap_mat_ctr(p_val: Val, _: Ext, val: Val, ext: Ext, _: Tag, tag: Tag, _: Term) Term {
+    return interact_mat_ctr(p_val, tag, val, ext);
+}
+
+/// Wrapper for SWI + NUM (needs stack sync - handled in reduce)
+fn wrap_swi_num(p_val: Val, _: Ext, val: Val, _: Ext, _: Tag, _: Tag, _: Term) Term {
+    return interact_swi_num(p_val, val);
+}
+
+/// Interaction requires stack synchronization (calls alloc/reduce internally)
+const NeedsSync = struct {
+    fn check(p_tag: Tag, tag: Tag) bool {
+        // APP+SUP, CO*+LAM, CO*+CTR, MAT+CTR, SWI+NUM all allocate
+        if (p_tag == APP and tag == SUP) return true;
+        if ((p_tag == CO0 or p_tag == CO1) and tag == LAM) return true;
+        if ((p_tag == CO0 or p_tag == CO1) and tag >= C00 and tag <= C15) return true;
+        if (p_tag == MAT and tag >= C00 and tag <= C15) return true;
+        if (p_tag == SWI and tag == NUM) return true;
+        return false;
+    }
+};
+
+/// Build the interaction dispatch table at compile time
+const interaction_table: [256][256]?InteractFn = blk: {
+    var table: [256][256]?InteractFn = .{.{null} ** 256} ** 256;
+
+    // APP interactions
+    table[APP][LAM] = wrap_app_lam;
+    table[APP][ERA] = wrap_app_era;
+    table[APP][SUP] = wrap_app_sup;
+
+    // CO0 interactions
+    table[CO0][SUP] = wrap_dup_sup;
+    table[CO0][NUM] = wrap_dup_num;
+    table[CO0][ERA] = wrap_dup_era;
+    table[CO0][LAM] = wrap_dup_lam;
+
+    // CO1 interactions
+    table[CO1][SUP] = wrap_dup_sup;
+    table[CO1][NUM] = wrap_dup_num;
+    table[CO1][ERA] = wrap_dup_era;
+    table[CO1][LAM] = wrap_dup_lam;
+
+    // CO0/CO1 + CTR interactions (all 16 constructors)
+    for ([_]Tag{ C00, C01, C02, C03, C04, C05, C06, C07, C08, C09, C10, C11, C12, C13, C14, C15 }) |ctr| {
+        table[CO0][ctr] = wrap_dup_ctr;
+        table[CO1][ctr] = wrap_dup_ctr;
+    }
+
+    // MAT + CTR interactions
+    for ([_]Tag{ C00, C01, C02, C03, C04, C05, C06, C07, C08, C09, C10, C11, C12, C13, C14, C15 }) |ctr| {
+        table[MAT][ctr] = wrap_mat_ctr;
+    }
+
+    // SWI + NUM
+    table[SWI][NUM] = wrap_swi_num;
+
+    break :blk table;
+};
+
+// =============================================================================
 // WNF Reduction (Weak Normal Form) - HVM4 Style
 // =============================================================================
 
@@ -941,78 +1051,20 @@ pub noinline fn reduce(term: Term) Term {
                 const p_ext = term_ext(prev);
                 const p_val = term_val(prev);
 
-                // APP + LAM: Beta reduction (most common)
-                if (p_tag == APP and tag == LAM) {
-                    @branchHint(.likely);
-                    heap[p_val] = next;
-                    next = interact_app_lam(p_val, val);
+                // Comptime dispatch table lookup for value-value interactions
+                if (interaction_table[p_tag][tag]) |interact_fn| {
+                    // Check if interaction needs stack synchronization
+                    if (NeedsSync.check(p_tag, tag)) {
+                        HVM.stack_pos = spos;
+                        next = interact_fn(p_val, p_ext, val, ext, p_tag, tag, next);
+                        spos = HVM.stack_pos;
+                    } else {
+                        next = interact_fn(p_val, p_ext, val, ext, p_tag, tag, next);
+                    }
                     continue;
                 }
 
-                // APP + ERA
-                if (p_tag == APP and tag == ERA) {
-                    next = interact_app_era();
-                    continue;
-                }
-
-                // APP + SUP
-                if (p_tag == APP and tag == SUP) {
-                    HVM.stack_pos = spos;
-                    next = interact_app_sup(p_val, val, ext);
-                    spos = HVM.stack_pos;
-                    continue;
-                }
-
-                // CO0/CO1 + SUP: Annihilation/commutation (critical)
-                if ((p_tag == CO0 or p_tag == CO1) and tag == SUP) {
-                    @branchHint(.likely);
-                    next = interact_dup_sup(p_tag, p_val, p_ext, val, ext);
-                    continue;
-                }
-
-                // CO0/CO1 + NUM
-                if ((p_tag == CO0 or p_tag == CO1) and tag == NUM) {
-                    next = interact_dup_num(p_val, next);
-                    continue;
-                }
-
-                // CO0/CO1 + ERA
-                if ((p_tag == CO0 or p_tag == CO1) and tag == ERA) {
-                    next = interact_dup_era(p_val);
-                    continue;
-                }
-
-                // CO0/CO1 + LAM
-                if ((p_tag == CO0 or p_tag == CO1) and tag == LAM) {
-                    HVM.stack_pos = spos;
-                    next = interact_dup_lam(p_tag, p_val, p_ext, val);
-                    spos = HVM.stack_pos;
-                    continue;
-                }
-
-                // CO0/CO1 + CTR
-                if ((p_tag == CO0 or p_tag == CO1) and tag >= C00 and tag <= C15) {
-                    HVM.stack_pos = spos;
-                    next = interact_dup_ctr(p_tag, p_val, p_ext, tag, val, ext);
-                    spos = HVM.stack_pos;
-                    continue;
-                }
-
-                // MAT + CTR
-                if (p_tag == MAT and tag >= C00 and tag <= C15) {
-                    HVM.stack_pos = spos;
-                    next = interact_mat_ctr(p_val, tag, val, ext);
-                    spos = HVM.stack_pos;
-                    continue;
-                }
-
-                // SWI + NUM
-                if (p_tag == SWI and tag == NUM) {
-                    HVM.stack_pos = spos;
-                    next = interact_swi_num(p_val, val);
-                    spos = HVM.stack_pos;
-                    continue;
-                }
+                // Frame handlers (not in dispatch table - need special handling)
 
                 // F_OP2 + NUM: First operand ready, reduce second
                 if (p_tag == F_OP2 and tag == NUM) {

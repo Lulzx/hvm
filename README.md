@@ -120,13 +120,13 @@ Optimized following [VictorTaelin's IC techniques](https://gist.github.com/Victo
 
 | Benchmark | Ops/sec | Notes |
 |-----------|---------|-------|
-| Single-threaded arithmetic | 95M | P02 binary primitives |
-| Beta reduction (λ application) | **185M** | Inlined APP-LAM |
-| CO0+SUP annihilation | 157M | Collapse projections |
+| Single-threaded arithmetic | ~130M | P02 binary primitives |
+| Beta reduction (λ application) | **~135M** | Comptime dispatch table |
+| CO0+SUP annihilation | ~140M | Collapse projections |
 | SIMD batch add | 1.3B | Vectorized, single-thread |
 | SIMD batch multiply | 3.1B | Vectorized, single-thread |
-| **Parallel SIMD add** | **12.4B** | **131x speedup** |
-| **Parallel SIMD multiply** | **14.1B** | Multi-threaded + SIMD |
+| **Parallel SIMD add** | **~13B** | **100x+ speedup** |
+| **Parallel SIMD multiply** | **~15B** | Multi-threaded + SIMD |
 
 ### Batch Operations API
 
