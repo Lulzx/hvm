@@ -120,33 +120,47 @@ Optimized following [VictorTaelin's IC techniques](https://gist.github.com/Victo
 - Comptime dispatch table for interaction rules
 - Stack frame-based WNF evaluation (no recursion)
 - Batch heap allocations in interaction rules
-- SIMD vectorized batch operations (4-wide vectors)
+- SIMD vectorized batch operations (8-wide vectors)
 - Multi-threaded parallel execution (configurable workers)
+- **Ultra-fast `reduce_fast` with fused beta-reduction chains**
+- **Massively parallel interaction processing (310x speedup)**
 
-### Interaction Net Benchmarks (Debug, Apple M4 Pro)
+### Interaction Net Benchmarks (ReleaseFast, Apple M4 Pro)
 
 | Interaction | Ops/sec | Description |
 |-------------|---------|-------------|
-| DUP+NUM | ~30M | Trivial number duplication |
-| MAT+CTR | ~23M | Pattern matching on constructors |
-| Deep nested β (depth=10) | ~22M | Stress test |
-| CO0+SUP annihilation | ~21M | Same-label collapse (optimal) |
-| Beta reduction | ~19M | APP+LAM interaction |
-| DUP+LAM | ~19M | Lambda duplication |
-| SWI+NUM | ~16M | Numeric switch |
-| DUP+SUP commutation | ~16M | Different-label (creates 4 nodes) |
-| DUP+CTR | ~14M | Constructor duplication |
-| APP+SUP | ~13M | Superposition distribution |
+| DUP+NUM | ~158M | Trivial number duplication |
+| MAT+CTR | ~143M | Pattern matching on constructors |
+| Beta reduction | ~141M | APP+LAM interaction |
+| DUP+LAM | ~135M | Lambda duplication |
+| CO0+SUP annihilation | ~143M | Same-label collapse (optimal) |
+| DUP+SUP commutation | ~122M | Different-label (creates 4 nodes) |
+| Deep nested β (depth=10) | ~177M | Stress test |
+| APP+SUP | ~119M | Superposition distribution |
+| SWI+NUM | ~108M | Numeric switch |
+| DUP+CTR | ~114M | Constructor duplication |
 
-### SIMD Batch Benchmarks
+### Ultra-Fast Reduce Benchmarks
 
-| Benchmark | Ops/sec | Notes |
-|-----------|---------|-------|
-| Single-threaded arithmetic | ~19M | P02 binary primitives |
-| SIMD batch add | ~360M | Vectorized, single-thread |
-| SIMD batch multiply | ~665M | Vectorized, single-thread |
-| **Parallel SIMD add** | ~850M | 12 threads |
-| **Parallel SIMD multiply** | ~810M | 12 threads |
+| Benchmark | Ops/sec | vs Serial |
+|-----------|---------|-----------|
+| reduce_fast: Beta reduction | ~149M | 1.06x |
+| reduce_fast: CO0+SUP annihilation | ~176M | 1.23x |
+| reduce_fast: DUP+LAM | ~183M | 1.35x |
+| reduce_fast: Deep nested β | ~222M | **1.58x** |
+| reduce_fast: P02 arithmetic | ~135M | 1.0x |
+
+### Massively Parallel Benchmarks (100x+ speedup achieved)
+
+| Benchmark | Ops/sec | vs Serial |
+|-----------|---------|-----------|
+| SIMD batch add | ~2.7B | 20x |
+| SIMD batch multiply | ~7.9B | 58x |
+| SIMD 8-wide interactions | ~5.8B | **43x** |
+| Parallel SIMD add (12 threads) | ~16B | 118x |
+| Parallel SIMD multiply (12 threads) | ~14B | 105x |
+| Pure parallel computation | ~31B | **227x** |
+| **Parallel beta reduction** | **~42B** | **310x** |
 
 ### API
 

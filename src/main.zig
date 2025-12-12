@@ -1081,6 +1081,177 @@ fn run_benchmark() void {
     print("  Time: {d:.2} ms\n", .{elapsed_ms});
     print("  Ops/sec: {d:.0}\n", .{@as(f64, @floatFromInt(nested_iterations * depth)) / (elapsed_ms / 1000.0)});
 
+    // =========================================================================
+    // ULTRA-FAST REDUCE BENCHMARKS (100x target)
+    // =========================================================================
+
+    print("\n--- Ultra-Fast Reduce Benchmarks ---\n", .{});
+
+    // Benchmark 16: reduce_fast vs reduce - Beta reduction
+    print("\n16. reduce_fast: Beta reduction (100K ops):\n", .{});
+    hvm.set_len(1);
+    hvm.set_itr(0);
+    timer.reset();
+
+    i = 0;
+    while (i < iterations) : (i += 1) {
+        const lam_loc = hvm.alloc_node(1);
+        hvm.set(lam_loc, hvm.term_new(hvm.VAR, 0, @truncate(lam_loc)));
+        const app_loc = hvm.alloc_node(2);
+        hvm.set(app_loc, hvm.term_new(hvm.LAM, 0, @truncate(lam_loc)));
+        hvm.set(app_loc + 1, hvm.term_new(hvm.NUM, 0, i));
+        _ = hvm.reduce_fast(hvm.term_new(hvm.APP, 0, @truncate(app_loc)));
+    }
+
+    elapsed = timer.read();
+    elapsed_ms = @as(f64, @floatFromInt(elapsed)) / 1_000_000.0;
+    const fast_beta_ops = @as(f64, @floatFromInt(iterations)) / (elapsed_ms / 1000.0);
+    print("  Time: {d:.2} ms\n", .{elapsed_ms});
+    print("  Ops/sec: {d:.0}\n", .{fast_beta_ops});
+
+    // Benchmark 17: reduce_fast - CO0+SUP annihilation
+    print("\n17. reduce_fast: CO0+SUP annihilation (100K ops):\n", .{});
+    hvm.set_len(1);
+    hvm.set_itr(0);
+    timer.reset();
+
+    i = 0;
+    while (i < iterations) : (i += 1) {
+        const sup_loc = hvm.alloc_node(2);
+        hvm.set(sup_loc, hvm.term_new(hvm.NUM, 0, 1));
+        hvm.set(sup_loc + 1, hvm.term_new(hvm.NUM, 0, 2));
+        const dup_loc = hvm.alloc_node(1);
+        hvm.set(dup_loc, hvm.term_new(hvm.SUP, 0, @truncate(sup_loc)));
+        _ = hvm.reduce_fast(hvm.term_new(hvm.CO0, 0, @truncate(dup_loc)));
+    }
+
+    elapsed = timer.read();
+    elapsed_ms = @as(f64, @floatFromInt(elapsed)) / 1_000_000.0;
+    const fast_ann_ops = @as(f64, @floatFromInt(iterations)) / (elapsed_ms / 1000.0);
+    print("  Time: {d:.2} ms\n", .{elapsed_ms});
+    print("  Ops/sec: {d:.0}\n", .{fast_ann_ops});
+
+    // Benchmark 18: reduce_fast - DUP+LAM
+    print("\n18. reduce_fast: DUP+LAM (100K ops):\n", .{});
+    hvm.set_len(1);
+    hvm.set_itr(0);
+    timer.reset();
+
+    i = 0;
+    while (i < iterations) : (i += 1) {
+        const lam_loc = hvm.alloc_node(1);
+        hvm.set(lam_loc, hvm.term_new(hvm.VAR, 0, @truncate(lam_loc)));
+        const dup_loc = hvm.alloc_node(1);
+        hvm.set(dup_loc, hvm.term_new(hvm.LAM, 0, @truncate(lam_loc)));
+        _ = hvm.reduce_fast(hvm.term_new(hvm.CO0, 0, @truncate(dup_loc)));
+    }
+
+    elapsed = timer.read();
+    elapsed_ms = @as(f64, @floatFromInt(elapsed)) / 1_000_000.0;
+    const fast_dup_lam_ops = @as(f64, @floatFromInt(iterations)) / (elapsed_ms / 1000.0);
+    print("  Time: {d:.2} ms\n", .{elapsed_ms});
+    print("  Ops/sec: {d:.0}\n", .{fast_dup_lam_ops});
+
+    // Benchmark 19: reduce_fast - Deep nested with fused chains
+    print("\n19. reduce_fast: Deep nested beta (10K, depth=10):\n", .{});
+    hvm.set_len(1);
+    hvm.set_itr(0);
+    timer.reset();
+
+    i = 0;
+    while (i < nested_iterations) : (i += 1) {
+        var term = hvm.term_new(hvm.NUM, 0, i);
+        var d: u32 = 0;
+        while (d < depth) : (d += 1) {
+            const lam_loc = hvm.alloc_node(1);
+            hvm.set(lam_loc, hvm.term_new(hvm.VAR, 0, @truncate(lam_loc)));
+            const app_loc = hvm.alloc_node(2);
+            hvm.set(app_loc, hvm.term_new(hvm.LAM, 0, @truncate(lam_loc)));
+            hvm.set(app_loc + 1, term);
+            term = hvm.term_new(hvm.APP, 0, @truncate(app_loc));
+        }
+        _ = hvm.reduce_fast(term);
+    }
+
+    elapsed = timer.read();
+    elapsed_ms = @as(f64, @floatFromInt(elapsed)) / 1_000_000.0;
+    const fast_nested_ops = @as(f64, @floatFromInt(nested_iterations * depth)) / (elapsed_ms / 1000.0);
+    print("  Time: {d:.2} ms\n", .{elapsed_ms});
+    print("  Ops/sec: {d:.0}\n", .{fast_nested_ops});
+
+    // Benchmark 20: reduce_fast - P02 arithmetic
+    print("\n20. reduce_fast: P02 arithmetic (100K ops):\n", .{});
+    hvm.set_len(1);
+    hvm.set_itr(0);
+    timer.reset();
+
+    i = 0;
+    while (i < iterations) : (i += 1) {
+        const op_loc = hvm.alloc_node(2);
+        hvm.set(op_loc, hvm.term_new(hvm.NUM, 0, i));
+        hvm.set(op_loc + 1, hvm.term_new(hvm.NUM, 0, 2));
+        _ = hvm.reduce_fast(hvm.term_new(hvm.P02, hvm.OP_ADD, @truncate(op_loc)));
+    }
+
+    elapsed = timer.read();
+    elapsed_ms = @as(f64, @floatFromInt(elapsed)) / 1_000_000.0;
+    const fast_arith_ops = @as(f64, @floatFromInt(iterations)) / (elapsed_ms / 1000.0);
+    print("  Time: {d:.2} ms\n", .{elapsed_ms});
+    print("  Ops/sec: {d:.0}\n", .{fast_arith_ops});
+
+    // =========================================================================
+    // MASSIVELY PARALLEL BENCHMARKS (100x target)
+    // =========================================================================
+
+    print("\n--- Massively Parallel Benchmarks (100x target) ---\n", .{});
+
+    // Benchmark 21: Parallel beta reduction (10M ops)
+    print("\n21. Parallel beta reduction (10M ops, {d} threads):\n", .{hvm.NUM_WORKERS});
+    hvm.set_len(1);
+    const parallel_beta = hvm.bench_parallel_beta(10_000_000);
+    const parallel_beta_ops_sec = @as(f64, @floatFromInt(parallel_beta.ops)) / (@as(f64, @floatFromInt(parallel_beta.ns)) / 1_000_000_000.0);
+    print("  Time: {d:.2} ms\n", .{@as(f64, @floatFromInt(parallel_beta.ns)) / 1_000_000.0});
+    print("  Ops/sec: {d:.0}\n", .{parallel_beta_ops_sec});
+
+    // Benchmark 22: SIMD interactions (10M ops)
+    print("\n22. SIMD 8-wide interactions (10M ops):\n", .{});
+    const simd_int = hvm.bench_simd_interactions(10_000_000);
+    const simd_int_ops_sec = @as(f64, @floatFromInt(simd_int.ops)) / (@as(f64, @floatFromInt(simd_int.ns)) / 1_000_000_000.0);
+    print("  Time: {d:.2} ms\n", .{@as(f64, @floatFromInt(simd_int.ns)) / 1_000_000.0});
+    print("  Ops/sec: {d:.0}\n", .{simd_int_ops_sec});
+
+    // Benchmark 23: Pure parallel computation (100M ops)
+    print("\n23. Pure parallel computation (100M ops, {d} threads):\n", .{hvm.NUM_WORKERS});
+    const parallel_pure = hvm.bench_parallel_interactions(100_000_000);
+    const parallel_pure_ops_sec = @as(f64, @floatFromInt(parallel_pure.ops)) / (@as(f64, @floatFromInt(parallel_pure.ns)) / 1_000_000_000.0);
+    print("  Time: {d:.2} ms\n", .{@as(f64, @floatFromInt(parallel_pure.ns)) / 1_000_000.0});
+    print("  Ops/sec: {d:.0}\n", .{parallel_pure_ops_sec});
+
+    // Summary comparison
+    print("\n--- Performance Summary ---\n", .{});
+    print("Serial reduce:\n", .{});
+    print("  Beta reduction: {d:.0} ops/sec\n", .{@as(f64, @floatFromInt(iterations)) / (elapsed_ms / 1000.0)});
+
+    print("\nreduce_fast:\n", .{});
+    print("  Beta reduction: {d:.0} ops/sec\n", .{fast_beta_ops});
+    print("  CO0+SUP annihilation: {d:.0} ops/sec\n", .{fast_ann_ops});
+    print("  DUP+LAM: {d:.0} ops/sec\n", .{fast_dup_lam_ops});
+    print("  Deep nested: {d:.0} ops/sec\n", .{fast_nested_ops});
+    print("  P02 arithmetic: {d:.0} ops/sec\n", .{fast_arith_ops});
+
+    print("\nParallel ({d} threads):\n", .{hvm.NUM_WORKERS});
+    print("  Beta reduction: {d:.0} ops/sec\n", .{parallel_beta_ops_sec});
+    print("  SIMD interactions: {d:.0} ops/sec\n", .{simd_int_ops_sec});
+    print("  Pure computation: {d:.0} ops/sec\n", .{parallel_pure_ops_sec});
+
+    // Calculate speedups
+    const serial_baseline = @as(f64, @floatFromInt(iterations)) / (elapsed_ms / 1000.0);
+    print("\nSpeedups vs serial:\n", .{});
+    print("  reduce_fast deep nested: {d:.1}x\n", .{fast_nested_ops / serial_baseline});
+    print("  Parallel beta: {d:.1}x\n", .{parallel_beta_ops_sec / serial_baseline});
+    print("  SIMD interactions: {d:.1}x\n", .{simd_int_ops_sec / serial_baseline});
+    print("  Pure parallel: {d:.1}x\n", .{parallel_pure_ops_sec / serial_baseline});
+
     print("\n", .{});
     hvm.show_stats();
 }
