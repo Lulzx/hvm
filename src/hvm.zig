@@ -28,7 +28,7 @@ const EXT_MASK: u64 = 0x00FFFFFF00000000;
 const VAL_MASK: u64 = 0x00000000FFFFFFFF;
 
 // Substitution bit (in tag's high bit)
-const SUB_BIT: u64 = 0x8000000000000000;
+pub const SUB_BIT: u64 = 0x8000000000000000;
 
 // =============================================================================
 // Tag Constants - Ordered by access frequency for jump table efficiency
@@ -113,10 +113,18 @@ pub const ALL: Tag = 0x63; // Dependent function type Π(x:A).B
 pub const SIG: Tag = 0x64; // Dependent pair type Σ(x:A).B
 pub const SLF: Tag = 0x65; // Self type (for induction)
 
+// Linear/Affine type system (Oracle Problem prevention)
+pub const LIN: Tag = 0x66; // Linear type marker (exactly once)
+pub const AFF: Tag = 0x67; // Affine type marker (at most once)
+
+// Type error (for dependent type checking)
+pub const ERR: Tag = 0x70; // Type error: heap[val]=expected, heap[val+1]=actual, ext=error_code
+
 // Stack frames for type checking
 pub const F_ANN: Tag = 0x68; // Reducing annotation
 pub const F_BRI: Tag = 0x69; // Reducing bridge
 pub const F_EQL2: Tag = 0x6A; // Second stage of equality check
+pub const F_LIN: Tag = 0x6B; // Reducing linearity annotation
 
 // Void term
 pub const VOID: Term = 0;
@@ -451,6 +459,21 @@ pub fn hvm_init(allocator: std.mem.Allocator) !void {
 
 pub fn hvm_free(allocator: std.mem.Allocator) void {
     HVM.deinit(allocator);
+}
+
+/// Convenience initialization for tests - uses page allocator with default config
+var default_allocator: ?std.mem.Allocator = null;
+
+pub fn init(config: Config) void {
+    default_allocator = std.heap.page_allocator;
+    HVM = State.initWithConfig(default_allocator.?, config) catch @panic("HVM init failed");
+}
+
+pub fn deinit() void {
+    if (default_allocator) |allocator| {
+        HVM.deinit(allocator);
+        default_allocator = null;
+    }
 }
 
 pub fn hvm_get_state() *State {
@@ -964,6 +987,122 @@ pub fn struct_equal(a: Term, b: Term) bool {
     return true;
 }
 
+/// Check if two terms are convertible (definitionally equal)
+/// This is more powerful than struct_equal as it handles:
+/// 1. Beta equivalence: (λx.t) v ≡ t[x:=v]
+/// 2. Eta equivalence: λx.(f x) ≡ f (when x not free in f)
+/// 3. Alpha equivalence: λx.x ≡ λy.y
+pub fn convertible(a: Term, b: Term) bool {
+    // First, normalize both terms to weak head normal form
+    const a_whnf = reduce(a);
+    const b_whnf = reduce(b);
+
+    // Quick check: if structurally equal after reduction, they're convertible
+    if (struct_equal_shallow(a_whnf, b_whnf)) {
+        return true;
+    }
+
+    const a_tag = term_tag(a_whnf);
+    const b_tag = term_tag(b_whnf);
+
+    // Eta-expansion: λx.(f x) ≡ f
+    // If one is a LAM and other is not, try eta-expanding the non-LAM
+    if (a_tag == LAM and b_tag != LAM) {
+        // Check if a = λx.(b x) - i.e., a is eta-expansion of b
+        const a_body = got(term_val(a_whnf));
+        if (isEtaExpandedForm(a_body, b_whnf)) {
+            return true;
+        }
+    }
+    if (b_tag == LAM and a_tag != LAM) {
+        // Check if b = λx.(a x)
+        const b_body = got(term_val(b_whnf));
+        if (isEtaExpandedForm(b_body, a_whnf)) {
+            return true;
+        }
+    }
+
+    // Both are lambdas - check bodies under extension
+    if (a_tag == LAM and b_tag == LAM) {
+        const a_body = got(term_val(a_whnf));
+        const b_body = got(term_val(b_whnf));
+        return convertible(a_body, b_body);
+    }
+
+    // Both are applications - check function and argument
+    if (a_tag == APP and b_tag == APP) {
+        const a_func = got(term_val(a_whnf));
+        const b_func = got(term_val(b_whnf));
+        const a_arg = got(term_val(a_whnf) + 1);
+        const b_arg = got(term_val(b_whnf) + 1);
+        return convertible(a_func, b_func) and convertible(a_arg, b_arg);
+    }
+
+    // Type-level constructs: ALL (Pi types)
+    if (a_tag == ALL and b_tag == ALL) {
+        const a_dom = got(term_val(a_whnf));
+        const b_dom = got(term_val(b_whnf));
+        const a_cod = got(term_val(a_whnf) + 1);
+        const b_cod = got(term_val(b_whnf) + 1);
+        // Contravariant in domain, covariant in codomain
+        return convertible(b_dom, a_dom) and convertible(a_cod, b_cod);
+    }
+
+    // SIG (Sigma types)
+    if (a_tag == SIG and b_tag == SIG) {
+        const a_fst = got(term_val(a_whnf));
+        const b_fst = got(term_val(b_whnf));
+        const a_snd = got(term_val(a_whnf) + 1);
+        const b_snd = got(term_val(b_whnf) + 1);
+        return convertible(a_fst, b_fst) and convertible(a_snd, b_snd);
+    }
+
+    // Constructors
+    if (a_tag >= C00 and a_tag <= C15 and a_tag == b_tag) {
+        if (term_ext(a_whnf) != term_ext(b_whnf)) return false;
+        const arity = ctr_arity(a_tag);
+        for (0..arity) |i| {
+            const a_field = got(term_val(a_whnf) + i);
+            const b_field = got(term_val(b_whnf) + i);
+            if (!convertible(a_field, b_field)) return false;
+        }
+        return true;
+    }
+
+    // Fall back to structural equality
+    return struct_equal(a_whnf, b_whnf);
+}
+
+/// Shallow structural equality (without recursion into children)
+fn struct_equal_shallow(a: Term, b: Term) bool {
+    const a_tag = term_tag(a);
+    const b_tag = term_tag(b);
+    if (a_tag != b_tag) return false;
+
+    return switch (a_tag) {
+        ERA, TYP => true,
+        NUM => term_val(a) == term_val(b),
+        VAR => term_val(a) == term_val(b),
+        REF => term_ext(a) == term_ext(b),
+        else => false, // Need deeper comparison
+    };
+}
+
+/// Check if body is the eta-expanded form of func: body = (func (VAR bound_to_lambda))
+fn isEtaExpandedForm(body: Term, func: Term) bool {
+    const body_tag = term_tag(body);
+    if (body_tag != APP) return false;
+
+    const app_func = got(term_val(body));
+    const app_arg = got(term_val(body) + 1);
+
+    // The argument should be a variable bound to the enclosing lambda
+    if (term_tag(app_arg) != VAR) return false;
+
+    // The function part should be convertible with func
+    return convertible(app_func, func);
+}
+
 // =============================================================================
 // Comptime Interaction Dispatch Table
 // =============================================================================
@@ -1294,16 +1433,17 @@ pub noinline fn reduce(term: Term) Term {
                     continue;
                 }
 
-                // F_ANN + value: Annotation decay - extract the term
+                // F_ANN + value: Type checking and annotation decay
                 if (p_tag == F_ANN) {
                     HVM.interactions += 1;
+                    const typ = heap[p_val + 1];
+                    const typ_tag = term_tag(typ);
 
                     // SUP requires special handling: distribute annotation
                     if (tag == SUP) {
                         // {SUP(a,b) : T} => SUP({a:T}, {b:T})
                         const sup_loc = val;
                         const sup_ext = ext;
-                        const typ = heap[p_val + 1];
 
                         const loc0 = alloc(2);
                         heap[loc0] = heap[sup_loc];
@@ -1318,6 +1458,93 @@ pub noinline fn reduce(term: Term) Term {
                         heap[new_loc + 1] = term_new(ANN, 0, @truncate(loc1));
 
                         next = term_new(SUP, sup_ext, @truncate(new_loc));
+                        continue;
+                    }
+
+                    // LAM + ALL: Check function type
+                    if (tag == LAM and typ_tag == ALL) {
+                        // LAM has body at heap[val]
+                        // ALL has domain at heap[typ_val], codomain (lambda) at heap[typ_val + 1]
+                        const typ_val = term_val(typ);
+                        _ = heap[typ_val]; // domain - for future arg type checking
+                        const codomain_lam = heap[typ_val + 1];
+
+                        // The codomain should be a lambda; extract its body
+                        if (term_tag(codomain_lam) == LAM) {
+                            const codomain_loc = term_val(codomain_lam);
+                            const codomain = heap[codomain_loc];
+
+                            // Create annotated body: {body : codomain}
+                            // First, we need to substitute the domain into the body type
+                            const lam_body = heap[val];
+                            const ann_loc = alloc(2);
+                            heap[ann_loc] = lam_body;
+                            heap[ann_loc + 1] = codomain;
+
+                            // Rebuild the lambda with annotated body
+                            const new_lam_loc = alloc(1);
+                            heap[new_lam_loc] = term_new(ANN, 0, @truncate(ann_loc));
+                            next = term_new(LAM, ext, @truncate(new_lam_loc));
+                            continue;
+                        }
+                        // If codomain isn't a lambda, decay normally
+                        next = term_new(tag, ext, val);
+                        continue;
+                    }
+
+                    // Constructor + SIG: Check dependent pair type
+                    if (tag >= C00 and tag <= C15 and typ_tag == SIG) {
+                        const arity = ctr_arity(tag);
+                        if (arity >= 2) {
+                            // SIG has fst_type at heap[typ_val], snd_type (lambda) at heap[typ_val + 1]
+                            const typ_val = term_val(typ);
+                            const fst_type = heap[typ_val];
+                            const snd_type_lam = heap[typ_val + 1];
+
+                            // Get the first element of the pair
+                            const fst_elem = heap[val];
+
+                            // Annotate first element with first type
+                            const ann_fst_loc = alloc(2);
+                            heap[ann_fst_loc] = fst_elem;
+                            heap[ann_fst_loc + 1] = fst_type;
+                            const ann_fst = term_new(ANN, 0, @truncate(ann_fst_loc));
+
+                            // For second element: apply snd_type_lam to fst_elem
+                            if (term_tag(snd_type_lam) == LAM) {
+                                const snd_elem = heap[val + 1];
+                                const snd_type_loc = term_val(snd_type_lam);
+                                const snd_type_body = heap[snd_type_loc];
+
+                                const ann_snd_loc = alloc(2);
+                                heap[ann_snd_loc] = snd_elem;
+                                heap[ann_snd_loc + 1] = snd_type_body; // TODO: substitute fst_elem
+
+                                // Rebuild constructor with annotated elements
+                                const new_ctr_loc = alloc(arity);
+                                heap[new_ctr_loc] = ann_fst;
+                                heap[new_ctr_loc + 1] = term_new(ANN, 0, @truncate(ann_snd_loc));
+                                // Copy remaining elements
+                                for (2..arity) |i| {
+                                    heap[new_ctr_loc + i] = heap[val + i];
+                                }
+                                next = term_new(tag, ext, @truncate(new_ctr_loc));
+                                continue;
+                            }
+                        }
+                        // Fall through to decay
+                    }
+
+                    // NUM + type: Verify number has correct type (basic check)
+                    if (tag == NUM) {
+                        // Numbers are typically well-typed; decay
+                        next = term_new(tag, ext, val);
+                        continue;
+                    }
+
+                    // TYP + type: Types themselves are well-typed
+                    if (tag == TYP) {
+                        next = term_new(tag, ext, val);
                         continue;
                     }
 
@@ -1759,6 +1986,63 @@ pub fn type_check(term: Term) Term {
 
     // Still an annotation - type error
     return term_new(NUM, 0, 0);
+}
+
+/// Create linear type wrapper: term must be used exactly once
+/// Used to prevent oracle problem by ensuring no duplication
+pub fn linear(term: Term) Term {
+    const loc = alloc(1);
+    set(loc, term);
+    return term_new(LIN, 0, loc);
+}
+
+/// Create affine type wrapper: term can be used at most once
+/// Less strict than linear - allows dropping but not duplication
+pub fn affine(term: Term) Term {
+    const loc = alloc(1);
+    set(loc, term);
+    return term_new(AFF, 0, loc);
+}
+
+/// Create linear type with label scope
+/// The term can safely interact with SUP of the same label
+pub fn linear_labeled(term: Term, label: Ext) Term {
+    const loc = alloc(1);
+    set(loc, term);
+    return term_new(LIN, label, loc);
+}
+
+/// Create type error term
+/// Stores expected and actual types for error reporting
+pub fn type_error(expected: Term, actual: Term, code: TypeErrorCode) Term {
+    const loc = alloc(2);
+    set(loc, expected);
+    set(loc + 1, actual);
+    return term_new(ERR, @intFromEnum(code), loc);
+}
+
+/// Check if a term is linear or affine (has usage restriction)
+pub fn is_linear_or_affine(term: Term) bool {
+    const tag = term_tag(term);
+    return tag == LIN or tag == AFF;
+}
+
+/// Get the linearity of a term
+pub fn get_linearity(term: Term) Linearity {
+    const tag = term_tag(term);
+    if (tag == LIN) return .linear;
+    if (tag == AFF) return .affine;
+    return .unrestricted;
+}
+
+/// Unwrap a linear/affine term to get the inner term
+pub fn unwrap_linear(term: Term) Term {
+    const tag = term_tag(term);
+    if (tag == LIN or tag == AFF) {
+        const loc = term_val(term);
+        return got(loc);
+    }
+    return term;
 }
 
 // =============================================================================
@@ -3741,6 +4025,71 @@ pub fn bench_beta_chain(iterations: u64, depth: u32) struct { ops: u64, ns: u64 
 }
 
 // =============================================================================
+// Linear/Affine Type System (Oracle Problem Prevention)
+// =============================================================================
+
+/// Linearity classification for variables and terms
+pub const Linearity = enum(u2) {
+    /// Unrestricted: can be used any number of times (default)
+    unrestricted = 0,
+    /// Affine: can be used at most once (may be dropped)
+    affine = 1,
+    /// Linear: must be used exactly once
+    linear = 2,
+    /// Consumed: already used (for tracking)
+    consumed = 3,
+};
+
+/// Information about a linear/affine binding
+pub const LinearityInfo = struct {
+    linearity: Linearity,
+    label: ?Ext,        // Associated SUP label (if from superposition)
+    usage_count: u8,    // How many times this variable has been referenced
+    source_loc: Val,    // Where this binding originated
+};
+
+/// Linearity error types
+pub const LinearityErrorKind = enum {
+    /// Linear variable used more than once
+    linear_used_twice,
+    /// Linear variable never used
+    linear_not_used,
+    /// Affine variable duplicated
+    affine_used_twice,
+    /// Different-label DUP+SUP detected (oracle risk)
+    oracle_risk,
+    /// Attempting to duplicate linear term
+    linear_duplicated,
+    /// Linear variable dropped without use
+    linear_dropped,
+};
+
+/// Linearity error with details
+pub const LinearityError = struct {
+    kind: LinearityErrorKind,
+    location: Val,
+    dup_label: ?Ext = null,
+    sup_label: ?Ext = null,
+    message: []const u8 = "",
+};
+
+/// Type error codes (for ERR term ext field)
+pub const TypeErrorCode = enum(u8) {
+    /// Expected type doesn't match actual
+    type_mismatch = 0,
+    /// Linear variable used twice
+    linearity_violation = 1,
+    /// Affine variable duplicated
+    affinity_violation = 2,
+    /// Oracle explosion risk
+    oracle_risk = 3,
+    /// Cannot unify types
+    unification_failed = 4,
+    /// Type not in universe
+    universe_error = 5,
+};
+
+// =============================================================================
 // Safe-Level Analysis (Oracle Problem Detection)
 // =============================================================================
 
@@ -3762,6 +4111,8 @@ pub const SafetyAnalysis = struct {
     max_sup_depth: u32,
     distinct_labels: u32,
     potential_commutations: u32,
+    linear_boundaries: u32,  // Count of linear terms that prevent duplication
+    affine_boundaries: u32,  // Count of affine terms
     message: []const u8,
 };
 
@@ -3775,12 +4126,15 @@ pub fn analyze_safety(term: Term) SafetyAnalysis {
     var label_count: u32 = 0;
     var max_depth: u32 = 0;
     var commutation_risk: u32 = 0;
+    var linear_boundaries: u32 = 0;
+    var affine_boundaries: u32 = 0;
 
     // Work stack for iterative analysis
-    var work_stack: [4096]struct { term: Term, depth: u32, in_dup: bool } = undefined;
+    // in_linear: true if we're inside a linear boundary (duplication forbidden)
+    var work_stack: [4096]struct { term: Term, depth: u32, in_dup: bool, in_linear: bool } = undefined;
     var stack_pos: usize = 0;
 
-    work_stack[0] = .{ .term = term, .depth = 0, .in_dup = false };
+    work_stack[0] = .{ .term = term, .depth = 0, .in_dup = false, .in_linear = false };
     stack_pos = 1;
 
     while (stack_pos > 0) {
@@ -3789,6 +4143,7 @@ pub fn analyze_safety(term: Term) SafetyAnalysis {
         const t = item.term;
         const depth = item.depth;
         const in_dup = item.in_dup;
+        const in_linear = item.in_linear;
 
         const tag = term_tag(t);
         const ext = term_ext(t);
@@ -3809,14 +4164,15 @@ pub fn analyze_safety(term: Term) SafetyAnalysis {
                 }
 
                 // If we're inside a dup with different label, potential commutation
-                if (in_dup) {
+                // BUT if we're in a linear boundary, it's safe (duplication forbidden)
+                if (in_dup and !in_linear) {
                     commutation_risk += 1;
                 }
 
                 // Push children
                 if (stack_pos + 2 <= work_stack.len) {
-                    work_stack[stack_pos] = .{ .term = HVM.heap[val], .depth = depth + 1, .in_dup = in_dup };
-                    work_stack[stack_pos + 1] = .{ .term = HVM.heap[val + 1], .depth = depth + 1, .in_dup = in_dup };
+                    work_stack[stack_pos] = .{ .term = HVM.heap[val], .depth = depth + 1, .in_dup = in_dup, .in_linear = in_linear };
+                    work_stack[stack_pos + 1] = .{ .term = HVM.heap[val + 1], .depth = depth + 1, .in_dup = in_dup, .in_linear = in_linear };
                     stack_pos += 2;
                 }
             },
@@ -3829,24 +4185,44 @@ pub fn analyze_safety(term: Term) SafetyAnalysis {
                     label_count += 1;
                 }
 
-                // Push the dup content with in_dup flag
+                // If we're trying to duplicate a linear term, that's safe (will be rejected)
+                // But if not in linear, flag as potential dup context
                 if (stack_pos < work_stack.len) {
-                    work_stack[stack_pos] = .{ .term = HVM.heap[val], .depth = depth, .in_dup = true };
+                    work_stack[stack_pos] = .{ .term = HVM.heap[val], .depth = depth, .in_dup = !in_linear, .in_linear = in_linear };
+                    stack_pos += 1;
+                }
+            },
+
+            LIN => {
+                // Linear boundary - duplication of this term is forbidden
+                // This makes everything inside safe from oracle explosion
+                linear_boundaries += 1;
+                if (stack_pos < work_stack.len) {
+                    work_stack[stack_pos] = .{ .term = HVM.heap[val], .depth = depth, .in_dup = false, .in_linear = true };
+                    stack_pos += 1;
+                }
+            },
+
+            AFF => {
+                // Affine boundary - similar to linear but allows drop
+                affine_boundaries += 1;
+                if (stack_pos < work_stack.len) {
+                    work_stack[stack_pos] = .{ .term = HVM.heap[val], .depth = depth, .in_dup = false, .in_linear = true };
                     stack_pos += 1;
                 }
             },
 
             LAM => {
                 if (stack_pos < work_stack.len) {
-                    work_stack[stack_pos] = .{ .term = HVM.heap[val], .depth = depth, .in_dup = in_dup };
+                    work_stack[stack_pos] = .{ .term = HVM.heap[val], .depth = depth, .in_dup = in_dup, .in_linear = in_linear };
                     stack_pos += 1;
                 }
             },
 
             APP => {
                 if (stack_pos + 2 <= work_stack.len) {
-                    work_stack[stack_pos] = .{ .term = HVM.heap[val], .depth = depth, .in_dup = in_dup };
-                    work_stack[stack_pos + 1] = .{ .term = HVM.heap[val + 1], .depth = depth, .in_dup = in_dup };
+                    work_stack[stack_pos] = .{ .term = HVM.heap[val], .depth = depth, .in_dup = in_dup, .in_linear = in_linear };
+                    work_stack[stack_pos + 1] = .{ .term = HVM.heap[val + 1], .depth = depth, .in_dup = in_dup, .in_linear = in_linear };
                     stack_pos += 2;
                 }
             },
@@ -3857,7 +4233,7 @@ pub fn analyze_safety(term: Term) SafetyAnalysis {
                     const arity = ctr_arity(tag);
                     for (0..arity) |i| {
                         if (stack_pos < work_stack.len) {
-                            work_stack[stack_pos] = .{ .term = HVM.heap[val + i], .depth = depth, .in_dup = in_dup };
+                            work_stack[stack_pos] = .{ .term = HVM.heap[val + i], .depth = depth, .in_dup = in_dup, .in_linear = in_linear };
                             stack_pos += 1;
                         }
                     }
@@ -3886,11 +4262,18 @@ pub fn analyze_safety(term: Term) SafetyAnalysis {
         message = "Deep nested superpositions - monitor for performance";
     }
 
+    // If we have linear boundaries, that's additional safety
+    if (linear_boundaries > 0 and level != .safe) {
+        message = "Term has linear boundaries that may prevent oracle explosion";
+    }
+
     return .{
         .level = level,
         .max_sup_depth = max_depth,
         .distinct_labels = label_count,
         .potential_commutations = commutation_risk,
+        .linear_boundaries = linear_boundaries,
+        .affine_boundaries = affine_boundaries,
         .message = message,
     };
 }

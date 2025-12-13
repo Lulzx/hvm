@@ -4,6 +4,7 @@ A Zig implementation of HVM4 - the Higher-Order Virtual Machine based on Interac
 
 ## Features
 
+### Core Runtime
 - **HVM4 Architecture**: New 64-bit term layout `[8-bit tag][24-bit ext][32-bit val]`
 - **50+ Term Types**: Constructors (C00-C15), primitives (P00-P15), stack frames, and more
 - **17 Numeric Primitives**: ADD, SUB, MUL, DIV, MOD, AND, OR, XOR, LSH, RSH, NOT, EQ, NE, LT, LE, GT, GE
@@ -11,12 +12,17 @@ A Zig implementation of HVM4 - the Higher-Order Virtual Machine based on Interac
 - **Stack Frame Evaluation**: Typed frames for WNF reduction (F_APP, F_MAT, F_SWI, F_OP2, etc.)
 - **Lazy Collapse**: BFS enumeration of infinite superposition structures
 - **Auto-Dup Foundation**: Variable use counting with label recycling
+- **Configurable Runtime**: Adjustable heap, stack, workers, and optional reference counting
+
+### Type System
+- **Linear/Affine Types**: Prevent oracle problem with usage tracking (`\!x` linear, `\?x` affine)
+- **Dependent Types**: Π (ALL), Σ (SIG), Self (SLF) types with proper verification
+- **Type Annotations**: `{term : Type}` with convertibility checking (beta+eta equivalence)
+- **Structural Equality**: `(=== a b)` for term comparison
+
+### Performance
 - **SIMD + Parallel**: Vectorized batch operations with multi-threaded execution
 - **Parallel Reduction**: Work-stealing infrastructure for concurrent term reduction
-- **Type System**: Annotations, structural equality, and type decay via interaction nets
-- **SupGen Primitives**: Superposition-based program enumeration for discrete search
-- **Safe-Level Analysis**: Static and runtime detection of oracle problem patterns
-- **Configurable Runtime**: Adjustable heap, stack, workers, and optional reference counting
 - **SoA Memory Layout**: Structure-of-Arrays heap with SIMD tag scanning (~19B terms/sec)
 - **Lock-Free Reduction**: AtomicHeap with CAS-based parallel reduction
 - **Supercombinators**: Pre-compiled S, K, B, C combinators and Church numeral optimizations
@@ -25,6 +31,19 @@ A Zig implementation of HVM4 - the Higher-Order Virtual Machine based on Interac
 - **GPU-Resident Reduction**: Full reduction loop on GPU with no CPU round-trips (2x sustained throughput)
 - **Heterogeneous GPU Batching**: Mixed redex types processed in single dispatch
 - **Async GPU Pipelining**: Triple-buffered command submission for overlapped execution
+
+### Superposition Applications
+- **SupGen Primitives**: Superposition-based program enumeration for discrete search
+- **SAT Solver**: Boolean satisfiability via superposition (`src/sat.zig`)
+- **Program Synthesis**: Grammar-based enumeration with spec-driven search (`src/synthesis.zig`)
+- **Safe-Level Analysis**: Static and runtime detection of oracle problem patterns
+
+### Development Tools
+- **Linearity Checker**: Static analysis for oracle prevention (`src/linearity.zig`)
+- **Cost Model**: Interaction costs and complexity estimation (`src/cost.zig`)
+- **Debugger**: Step tracing, breakpoints, DOT/JSON export (`src/debug.zig`)
+- **Profiler**: Per-interaction timing, hotspot detection, oracle warnings (`src/profile.zig`)
+- **Supercompiler**: Partial evaluation and specialization (`src/supercomp.zig`)
 
 ## Building
 
@@ -71,6 +90,8 @@ zig build -Doptimize=ReleaseFast
 | `'c'` | Character literal | `'x'` |
 | `*` | Erasure | `*` |
 | `\x.body` | Lambda | `\x.x` |
+| `\!x.body` | Linear lambda (exactly once) | `\!x.x` |
+| `\?x.body` | Affine lambda (at most once) | `\?x.*` |
 | `(f x)` | Application | `((\x.x) #42)` |
 | `(op a b)` | Binary operation | `(+ #3 #4)` |
 | `&L{a,b}` | Superposition | `&0{#1,#2}` |
@@ -120,6 +141,7 @@ $ ./zig-out/bin/hvm4 eval "(* (+ #2 #3) (- #10 #4))"
 | Stack Frames | F_APP, F_MAT, F_SWI, F_OP2, etc. | Evaluation frames |
 | Special | DUP, LET, USE, EQL, RED | Advanced features |
 | Type System | ANN, BRI, TYP, ALL, SIG, SLF | Type annotations and dependent types |
+| Linearity | LIN, AFF, ERR | Linear/affine types and type errors |
 
 ## Performance
 

@@ -72,13 +72,23 @@ pub const Book = struct {
 // Parser
 // =============================================================================
 
+/// Variable binding info with linearity tracking
+pub const VarBinding = struct {
+    loc: u64,
+    linearity: hvm.Linearity,
+    label: ?hvm.Ext,
+    usage_count: u8,
+};
+
 pub const Parser = struct {
     text: []const u8,
     pos: usize,
     allocator: Allocator,
     book: *Book,
-    vars: StringHashMap(u64), // Variable name -> heap location
+    vars: StringHashMap(u64), // Variable name -> heap location (legacy)
+    var_bindings: StringHashMap(VarBinding), // Variable name -> full binding info
     var_counter: u64,
+    linearity_errors: ArrayList(hvm.LinearityError),
 
     pub fn init(text: []const u8, allocator: Allocator, book: *Book) Parser {
         return .{
@@ -87,12 +97,26 @@ pub const Parser = struct {
             .allocator = allocator,
             .book = book,
             .vars = StringHashMap(u64).init(allocator),
+            .var_bindings = StringHashMap(VarBinding).init(allocator),
             .var_counter = 0,
+            .linearity_errors = ArrayList(hvm.LinearityError).empty,
         };
     }
 
     pub fn deinit(self: *Parser) void {
         self.vars.deinit();
+        self.var_bindings.deinit();
+        self.linearity_errors.deinit(self.allocator);
+    }
+
+    /// Check if any linearity errors occurred during parsing
+    pub fn hasLinearityErrors(self: *Parser) bool {
+        return self.linearity_errors.items.len > 0;
+    }
+
+    /// Get linearity errors for reporting
+    pub fn getLinearityErrors(self: *Parser) []hvm.LinearityError {
+        return self.linearity_errors.items;
     }
 
     // Skip whitespace and comments
@@ -223,10 +247,53 @@ pub const Parser = struct {
     // Bind a variable name to a heap location
     fn bindVar(self: *Parser, var_name: []const u8, loc: u64) !void {
         try self.vars.put(var_name, loc);
+        // Also add to bindings with unrestricted linearity for compatibility
+        try self.var_bindings.put(var_name, .{
+            .loc = loc,
+            .linearity = .unrestricted,
+            .label = null,
+            .usage_count = 0,
+        });
     }
 
-    // Look up a variable
+    // Bind a variable with linearity tracking
+    fn bindVarWithLinearity(self: *Parser, var_name: []const u8, loc: u64, linearity: hvm.Linearity, label: ?hvm.Ext) !void {
+        try self.vars.put(var_name, loc);
+        try self.var_bindings.put(var_name, .{
+            .loc = loc,
+            .linearity = linearity,
+            .label = label,
+            .usage_count = 0,
+        });
+    }
+
+    // Look up a variable and track usage for linearity checking
     fn lookupVar(self: *Parser, var_name: []const u8) ?u64 {
+        return self.vars.get(var_name);
+    }
+
+    // Look up a variable and increment usage count (for linearity checking)
+    fn useVar(self: *Parser, var_name: []const u8) !?u64 {
+        if (self.var_bindings.getPtr(var_name)) |binding| {
+            binding.usage_count += 1;
+
+            // Check for linearity violations
+            if (binding.linearity == .linear and binding.usage_count > 1) {
+                try self.linearity_errors.append(self.allocator, .{
+                    .kind = .linear_used_twice,
+                    .location = @truncate(binding.loc),
+                    .message = "Linear variable used more than once",
+                });
+            } else if (binding.linearity == .affine and binding.usage_count > 1) {
+                try self.linearity_errors.append(self.allocator, .{
+                    .kind = .affine_used_twice,
+                    .location = @truncate(binding.loc),
+                    .message = "Affine variable used more than once",
+                });
+            }
+
+            return binding.loc;
+        }
         return self.vars.get(var_name);
     }
 
@@ -311,11 +378,35 @@ pub const Parser = struct {
         }
 
         // Lambda: λx.body or \x.body
+        // Linear lambda: \!x.body (x must be used exactly once)
+        // Affine lambda: \?x.body (x may be used at most once)
+        // Label-scoped linear: \!L:x.body (safe with SUP of label L)
         if (c == '\\' or c == 0xCE) { // 0xCE is first byte of λ in UTF-8
             if (c == 0xCE) {
                 self.pos += 2; // Skip λ (2 bytes in UTF-8)
             } else {
                 self.pos += 1;
+            }
+
+            // Check for linearity modifier
+            var linearity: hvm.Linearity = .unrestricted;
+            var label_bound: ?hvm.Ext = null;
+
+            if (self.peek()) |modifier| {
+                if (modifier == '!') {
+                    self.pos += 1;
+                    linearity = .linear;
+                    // Check for label: \!L:x.body
+                    if (self.peek()) |pc| {
+                        if (pc >= '0' and pc <= '9') {
+                            label_bound = @truncate(try self.integer());
+                            try self.consume(':');
+                        }
+                    }
+                } else if (modifier == '?') {
+                    self.pos += 1;
+                    linearity = .affine;
+                }
             }
 
             const var_name = try self.name();
@@ -325,7 +416,8 @@ pub const Parser = struct {
             const lam_loc = hvm.alloc_node(1);
 
             // Bind variable to lambda location (for VAR to point back)
-            try self.bindVar(var_name, lam_loc);
+            // Store linearity info in the binding for later checking
+            try self.bindVarWithLinearity(var_name, lam_loc, linearity, label_bound);
 
             // Parse body
             const body = try self.term();
@@ -333,7 +425,19 @@ pub const Parser = struct {
             // Set lambda body
             hvm.set(lam_loc, body);
 
-            return hvm.term_new(hvm.LAM, 0, @truncate(lam_loc));
+            // For linear/affine lambdas, wrap the result
+            const lam_term = hvm.term_new(hvm.LAM, 0, @truncate(lam_loc));
+
+            if (linearity == .linear) {
+                return if (label_bound) |lab|
+                    hvm.linear_labeled(lam_term, lab)
+                else
+                    hvm.linear(lam_term);
+            } else if (linearity == .affine) {
+                return hvm.affine(lam_term);
+            }
+
+            return lam_term;
         }
 
         // Function reference: @name(args...)
@@ -545,7 +649,8 @@ pub const Parser = struct {
         // Variable
         if (isNameStart(c)) {
             const var_name = try self.name();
-            if (self.lookupVar(var_name)) |loc| {
+            // Use useVar to track linearity
+            if (try self.useVar(var_name)) |loc| {
                 return hvm.term_new(hvm.VAR, 0, @truncate(loc));
             }
             return ParseError.UndefinedVariable;
@@ -905,6 +1010,29 @@ fn prettyInto(allocator: Allocator, buf: *ArrayList(u8), term: hvm.Term) !void {
         hvm.SLF => {
             try buf.appendSlice(allocator, "Self.");
             try prettyInto(allocator, buf, hvm.got(val));
+        },
+        hvm.LIN => {
+            // Linear type: Lin(term) or Lin_L(term) if labeled
+            if (ext != 0) {
+                try std.fmt.format(buf.writer(allocator), "Lin_{d}(", .{ext});
+            } else {
+                try buf.appendSlice(allocator, "Lin(");
+            }
+            try prettyInto(allocator, buf, hvm.got(val));
+            try buf.append(allocator, ')');
+        },
+        hvm.AFF => {
+            try buf.appendSlice(allocator, "Aff(");
+            try prettyInto(allocator, buf, hvm.got(val));
+            try buf.append(allocator, ')');
+        },
+        hvm.ERR => {
+            // Type error: ERR(expected, actual, code)
+            try buf.appendSlice(allocator, "ERR{expected=");
+            try prettyInto(allocator, buf, hvm.got(val));
+            try buf.appendSlice(allocator, ", actual=");
+            try prettyInto(allocator, buf, hvm.got(val + 1));
+            try std.fmt.format(buf.writer(allocator), ", code={d}}}", .{ext});
         },
         else => {
             // Handle constructors C00-C15
