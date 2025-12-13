@@ -440,10 +440,119 @@ pub const State = struct {
     }
 };
 
-/// Generic function dispatch - retrieves body from HVM state
+/// Generic function dispatch - retrieves body from HVM state and copies it
 pub fn funcDispatch(ref: Term) Term {
     const fid = term_ext(ref);
-    return HVM.func_bodies[fid];
+    const body = HVM.func_bodies[fid];
+    // Deep copy the term to get fresh heap locations for each call
+    // Use a simple array to map old locations to new locations
+    var loc_map: [256]u64 = [_]u64{0} ** 256;
+    var map_count: usize = 0;
+    return copyTermWithMap(body, &loc_map, &map_count);
+}
+
+/// Deep copy a term, allocating fresh heap locations and remapping VARs
+fn copyTermWithMap(term: Term, loc_map: *[256]u64, map_count: *usize) Term {
+    const tag = term_tag(term);
+    const ext = term_ext(term);
+    const val = term_val(term);
+
+    return switch (tag) {
+        // Values that don't need copying
+        ERA, NUM, TYP => term,
+
+        // Lambda: copy body to fresh location and record mapping
+        LAM => {
+            const new_loc = alloc(1);
+            // Record the mapping from old location to new location
+            if (map_count.* < 256) {
+                // Store as pair: [old_loc, new_loc] using even/odd indices
+                const idx = map_count.* * 2;
+                if (idx + 1 < 256) {
+                    loc_map[idx] = val;
+                    loc_map[idx + 1] = new_loc;
+                    map_count.* += 1;
+                }
+            }
+            const body = HVM.heap[val];
+            HVM.heap[new_loc] = copyTermWithMap(body, loc_map, map_count);
+            return term_new(LAM, ext, @truncate(new_loc));
+        },
+
+        // Application: copy both function and argument
+        APP => {
+            const new_loc = alloc(2);
+            HVM.heap[new_loc] = copyTermWithMap(HVM.heap[val], loc_map, map_count);
+            HVM.heap[new_loc + 1] = copyTermWithMap(HVM.heap[val + 1], loc_map, map_count);
+            return term_new(APP, ext, @truncate(new_loc));
+        },
+
+        // Constructors: copy all fields
+        C00, C01, C02, C03, C04, C05, C06, C07, C08, C09, C10, C11, C12, C13, C14, C15 => {
+            const arity = ctr_arity(tag);
+            if (arity == 0) return term;
+            const new_loc = alloc(arity);
+            for (0..arity) |i| {
+                HVM.heap[new_loc + i] = copyTermWithMap(HVM.heap[val + i], loc_map, map_count);
+            }
+            return term_new(tag, ext, @truncate(new_loc));
+        },
+
+        // MAT: copy scrutinee and all branches
+        MAT => {
+            const num_cases = ext;
+            const new_loc = alloc(1 + num_cases);
+            HVM.heap[new_loc] = copyTermWithMap(HVM.heap[val], loc_map, map_count);
+            for (0..num_cases) |i| {
+                HVM.heap[new_loc + 1 + i] = copyTermWithMap(HVM.heap[val + 1 + i], loc_map, map_count);
+            }
+            return term_new(MAT, ext, @truncate(new_loc));
+        },
+
+        // SWI: copy scrutinee and branches
+        SWI => {
+            const new_loc = alloc(3);
+            HVM.heap[new_loc] = copyTermWithMap(HVM.heap[val], loc_map, map_count);
+            HVM.heap[new_loc + 1] = copyTermWithMap(HVM.heap[val + 1], loc_map, map_count);
+            HVM.heap[new_loc + 2] = copyTermWithMap(HVM.heap[val + 2], loc_map, map_count);
+            return term_new(SWI, ext, @truncate(new_loc));
+        },
+
+        // VAR: remap to new location if it was copied
+        VAR => {
+            // Look up the old location in the map
+            for (0..map_count.*) |i| {
+                const idx = i * 2;
+                if (idx + 1 < 256 and loc_map[idx] == val) {
+                    return term_new(VAR, ext, @truncate(loc_map[idx + 1]));
+                }
+            }
+            // Not found in map - return as-is
+            return term;
+        },
+
+        // SUP: copy both branches
+        SUP => {
+            const new_loc = alloc(2);
+            HVM.heap[new_loc] = copyTermWithMap(HVM.heap[val], loc_map, map_count);
+            HVM.heap[new_loc + 1] = copyTermWithMap(HVM.heap[val + 1], loc_map, map_count);
+            return term_new(SUP, ext, @truncate(new_loc));
+        },
+
+        // REF: just return (will be expanded later)
+        REF => term,
+
+        // Operations
+        P02 => {
+            const new_loc = alloc(2);
+            HVM.heap[new_loc] = copyTermWithMap(HVM.heap[val], loc_map, map_count);
+            HVM.heap[new_loc + 1] = copyTermWithMap(HVM.heap[val + 1], loc_map, map_count);
+            return term_new(P02, ext, @truncate(new_loc));
+        },
+
+        // Default: just return as-is
+        else => term,
+    };
 }
 
 // Thread-local HVM state

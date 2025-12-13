@@ -272,18 +272,35 @@ pub const Compiler = struct {
         try self.pushScope();
         defer self.popScope();
 
-        // Bind parameters
+        // First, allocate all lambda locations for parameters (in reverse order)
+        // This way innermost params are allocated first
+        var param_locs = try self.allocator.alloc(u64, funcdef.params.len);
+        defer self.allocator.free(param_locs);
+
+        for (funcdef.params, 0..) |_, i| {
+            param_locs[i] = hvm.alloc_node(1);
+        }
+
+        // Bind parameters to their lambda locations
         for (funcdef.params, 0..) |param, i| {
-            const loc = hvm.alloc_node(1);
-            try self.bindVar(param.name, loc);
-            _ = i;
+            try self.bindVar(param.name, param_locs[i]);
         }
 
         // Compile body
-        const body = switch (funcdef.body) {
+        var body = switch (funcdef.body) {
             .expr => |expr| try self.compileExpr(expr),
             .stmts => |stmts| try self.compileStmts(stmts),
         };
+
+        // Wrap body in lambdas for each parameter (innermost first, so iterate reverse)
+        var i: usize = funcdef.params.len;
+        while (i > 0) {
+            i -= 1;
+            // Set the lambda body
+            hvm.set(param_locs[i], body);
+            // Create lambda term
+            body = hvm.term_new(hvm.LAM, 0, @truncate(param_locs[i]));
+        }
 
         // Register compiled function
         const state = hvm.hvm_get_state();
@@ -386,18 +403,62 @@ pub const Compiler = struct {
             try self.bindVar(name, hvm.term_val(scrutinee));
         }
 
-        // Get the type from the first pattern
         if (match_stmt.cases.len == 0) {
             return hvm.term_new(hvm.ERA, 0, 0);
         }
 
-        // Compile cases
+        // Compile cases - each case becomes a lambda that receives constructor fields
+        // Cases must be indexed by constructor ID
         var case_terms = try self.allocator.alloc(hvm.Term, match_stmt.cases.len);
-        for (match_stmt.cases, 0..) |case, i| {
+        defer self.allocator.free(case_terms);
+
+        // Initialize with erasure (for missing cases)
+        for (case_terms) |*ct| {
+            ct.* = hvm.term_new(hvm.ERA, 0, 0);
+        }
+
+        for (match_stmt.cases) |case| {
+            const pattern = case.pattern;
+            if (pattern.kind != .constructor) continue;
+
+            const ctor = pattern.kind.constructor;
+            const info = self.ctors.get(ctor.name) orelse continue;
+            const case_idx = info.id;
+
             try self.pushScope();
-            try self.bindPattern(case.pattern, scrutinee);
-            case_terms[i] = try self.compileStmts(case.body);
+
+            // Create lambdas for each field (in reverse order so innermost is first)
+            var lam_locs = try self.allocator.alloc(u64, ctor.fields.len);
+            defer self.allocator.free(lam_locs);
+
+            for (ctor.fields, 0..) |_, i| {
+                lam_locs[i] = hvm.alloc_node(1);
+            }
+
+            // Bind field names to their lambda locations
+            for (ctor.fields, 0..) |field, i| {
+                if (field.pattern.kind == .var_) {
+                    try self.bindVar(field.pattern.kind.var_, lam_locs[i]);
+                }
+            }
+
+            // Compile body
+            var body = try self.compileStmts(case.body);
+
+            // Wrap in lambdas (innermost first)
+            var i: usize = ctor.fields.len;
+            while (i > 0) {
+                i -= 1;
+                hvm.set(lam_locs[i], body);
+                body = hvm.term_new(hvm.LAM, 0, @truncate(lam_locs[i]));
+            }
+
             self.popScope();
+
+            // Place at correct index
+            if (case_idx < case_terms.len) {
+                case_terms[case_idx] = body;
+            }
         }
 
         // Create MAT node
@@ -638,12 +699,19 @@ pub const Compiler = struct {
     }
 
     fn compileFunctionCall(self: *Compiler, fid: u16, args: []const *ast.Expr) CompileError!hvm.Term {
-        const loc = hvm.alloc_node(args.len);
-        for (args, 0..) |arg, i| {
-            const compiled = try self.compileExpr(arg);
-            hvm.set(loc + i, compiled);
+        // Get the function reference (no args in REF, args via APP)
+        var result = hvm.term_new(hvm.REF, fid, 0);
+
+        // Apply each argument using APP nodes
+        for (args) |arg| {
+            const compiled_arg = try self.compileExpr(arg);
+            const loc = hvm.alloc_node(2);
+            hvm.set(loc, result);
+            hvm.set(loc + 1, compiled_arg);
+            result = hvm.term_new(hvm.APP, 0, @truncate(loc));
         }
-        return hvm.term_new(hvm.REF, fid, @truncate(loc));
+
+        return result;
     }
 
     fn compileApp(self: *Compiler, func: *const ast.Expr, args: []const *ast.Expr) CompileError!hvm.Term {
