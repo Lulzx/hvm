@@ -37,6 +37,7 @@ pub const Program = struct {
     funcs: ArrayList(FuncDef),
     main: ?*Expr,
     allocator: Allocator,
+    arena: ?*std.heap.ArenaAllocator,
 
     pub fn init(allocator: Allocator) Program {
         return .{
@@ -45,13 +46,35 @@ pub const Program = struct {
             .funcs = .empty,
             .main = null,
             .allocator = allocator,
+            .arena = null,
+        };
+    }
+
+    pub fn initWithArena(arena: *std.heap.ArenaAllocator) Program {
+        const alloc = arena.allocator();
+        return .{
+            .types = .empty,
+            .objects = .empty,
+            .funcs = .empty,
+            .main = null,
+            .allocator = alloc,
+            .arena = arena,
         };
     }
 
     pub fn deinit(self: *Program) void {
-        self.types.deinit(self.allocator);
-        self.objects.deinit(self.allocator);
-        self.funcs.deinit(self.allocator);
+        // If we have an arena, just destroy it - frees everything at once
+        if (self.arena) |arena| {
+            // Get the backing allocator before destroying
+            const backing = arena.child_allocator;
+            arena.deinit();
+            backing.destroy(arena);
+        } else {
+            // Manual cleanup (shouldn't happen with arena usage)
+            self.types.deinit(self.allocator);
+            self.objects.deinit(self.allocator);
+            self.funcs.deinit(self.allocator);
+        }
     }
 };
 

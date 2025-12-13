@@ -73,9 +73,31 @@ pub const Compiler = struct {
     }
 
     pub fn deinit(self: *Compiler) void {
+        // Free allocated ctor info - track which IDs we've freed to avoid double-free
+        // (same CtorInfo is stored under both full name and short name)
+        var freed_ids = std.AutoHashMap(u16, void).init(self.allocator);
+        defer freed_ids.deinit();
+
+        var ctor_it = self.ctors.iterator();
+        while (ctor_it.next()) |entry| {
+            const id = entry.value_ptr.id;
+            if (freed_ids.get(id) == null) {
+                // Free the allocated field arrays only once per constructor
+                self.allocator.free(entry.value_ptr.fields);
+                self.allocator.free(entry.value_ptr.recursive_fields);
+                freed_ids.put(id, {}) catch {};
+            }
+            // Free the allocated keys (full_name strings like "Type/Ctor")
+            if (std.mem.indexOfScalar(u8, entry.key_ptr.*, '/') != null) {
+                self.allocator.free(entry.key_ptr.*);
+            }
+        }
         self.ctors.deinit();
+
         var it = self.type_ctors.valueIterator();
         while (it.next()) |list| {
+            // Note: full_name strings already freed above via ctors keys
+            // Just deinit the ArrayList itself
             var l = list.*;
             l.deinit(self.allocator);
         }
@@ -152,6 +174,17 @@ pub const Compiler = struct {
         // Compile main expression if present
         if (program.main) |main_expr| {
             return try self.compileExpr(main_expr);
+        }
+
+        // Look for a function named "main" and create a call to it
+        for (program.funcs.items) |funcdef| {
+            if (std.mem.eql(u8, funcdef.name, "main")) {
+                // Create a REF to the main function with no arguments
+                if (self.funcs.get("main")) |fid| {
+                    // main() with no args - just a REF with loc 0
+                    return hvm.term_new(hvm.REF, fid, 0);
+                }
+            }
         }
 
         return null;

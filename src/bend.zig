@@ -1588,10 +1588,24 @@ pub fn parse(source: []const u8, allocator: Allocator) !ast.Program {
     var tokens = try lex.tokenize();
     defer tokens.deinit(allocator);
 
-    var parser = Parser.init(tokens.items, allocator);
-    defer parser.deinit();
+    // Create an arena for AST allocations - destroyed on Program.deinit()
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    arena.* = std.heap.ArenaAllocator.init(allocator);
+    errdefer {
+        arena.deinit();
+        allocator.destroy(arena);
+    }
+    const arena_alloc = arena.allocator();
 
-    return parser.parseProgram();
+    var parser_inst = Parser.init(tokens.items, arena_alloc);
+    // Don't defer parser_inst.deinit() - errors list is in arena
+
+    var program = parser_inst.parseProgram() catch |err| {
+        // Arena cleanup happens via errdefer
+        return err;
+    };
+    program.arena = arena;
+    return program;
 }
 
 // =============================================================================
