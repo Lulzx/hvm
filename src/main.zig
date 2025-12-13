@@ -2,6 +2,11 @@ const std = @import("std");
 const hvm = @import("hvm.zig");
 const parser = @import("parser.zig");
 const metal = @import("metal.zig");
+const ast = @import("ast.zig");
+const lexer = @import("lexer.zig");
+const bend = @import("bend.zig");
+const compile = @import("compile.zig");
+const typecheck = @import("typecheck.zig");
 const print = std.debug.print;
 
 // =============================================================================
@@ -293,6 +298,195 @@ fn run_eval(allocator: std.mem.Allocator, code: []const u8) !void {
 }
 
 // =============================================================================
+// Bend File Runner
+// =============================================================================
+
+fn run_bend_file(allocator: std.mem.Allocator, path: []const u8) !void {
+    // Read file
+    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+        print("Error: cannot open file '{s}': {any}\n", .{ path, err });
+        return;
+    };
+    defer file.close();
+
+    const content = file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch |err| {
+        print("Error: cannot read file: {any}\n", .{err});
+        return;
+    };
+    defer allocator.free(content);
+
+    print("Running Bend: {s}\n", .{path});
+    print("---\n", .{});
+
+    const start = std.time.microTimestamp();
+
+    // Parse Bend source
+    var program = bend.parse(content, allocator) catch |err| {
+        print("Parse error: {any}\n", .{err});
+        return;
+    };
+    defer program.deinit();
+
+    // Compile to HVM4
+    var book = parser.Book.init(allocator);
+    var compiler = compile.Compiler.init(allocator, &book);
+    defer compiler.deinit();
+
+    const term = compiler.compileProgram(&program) catch |err| {
+        print("Compile error: {any}\n", .{err});
+        return;
+    };
+
+    if (term) |t| {
+        const result = hvm.reduce(t);
+        const end = std.time.microTimestamp();
+
+        // Print result
+        print("Result: ", .{});
+        const pretty_result = parser.pretty(allocator, result) catch {
+            show_term(result);
+            print("\n", .{});
+            return;
+        };
+        defer allocator.free(pretty_result);
+        print("{s}\n", .{pretty_result});
+
+        print("---\n", .{});
+        print("Time: {d} us\n", .{end - start});
+        print("Interactions: {d}\n", .{hvm.get_itrs()});
+    } else {
+        print("No main expression found\n", .{});
+    }
+}
+
+fn check_bend_file(allocator: std.mem.Allocator, path: []const u8) !void {
+    // Read file
+    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+        print("Error: cannot open file '{s}': {any}\n", .{ path, err });
+        return;
+    };
+    defer file.close();
+
+    const content = file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch |err| {
+        print("Error: cannot read file: {any}\n", .{err});
+        return;
+    };
+    defer allocator.free(content);
+
+    print("Type checking: {s}\n", .{path});
+    print("---\n", .{});
+
+    // Parse Bend source
+    var program = bend.parse(content, allocator) catch |err| {
+        print("Parse error: {any}\n", .{err});
+        return;
+    };
+    defer program.deinit();
+
+    // Type check
+    var tc = typecheck.typecheck(&program, allocator) catch |err| {
+        print("Type error: {any}\n", .{err});
+        return;
+    };
+    defer tc.deinit();
+
+    if (tc.errors.items.len > 0) {
+        print("Type errors:\n", .{});
+        for (tc.errors.items) |err| {
+            print("  Line {d}: {s}\n", .{ err.span.line, err.message });
+        }
+    } else {
+        print("Type check passed!\n", .{});
+    }
+
+    // Print inferred types for functions
+    print("\nInferred types:\n", .{});
+    for (program.funcs.items) |func| {
+        print("  {s}: ", .{func.name});
+        if (tc.env.lookup(func.name)) |scheme| {
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(allocator);
+            tc.prettyType(scheme.body, buf.writer(allocator)) catch {};
+            print("{s}\n", .{buf.items});
+        } else {
+            print("?\n", .{});
+        }
+    }
+}
+
+fn compile_bend_file(allocator: std.mem.Allocator, path: []const u8, output_path: ?[]const u8) !void {
+    // Read file
+    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+        print("Error: cannot open file '{s}': {any}\n", .{ path, err });
+        return;
+    };
+    defer file.close();
+
+    const content = file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch |err| {
+        print("Error: cannot read file: {any}\n", .{err});
+        return;
+    };
+    defer allocator.free(content);
+
+    print("Compiling: {s}\n", .{path});
+
+    // Parse Bend source
+    var program = bend.parse(content, allocator) catch |err| {
+        print("Parse error: {any}\n", .{err});
+        return;
+    };
+    defer program.deinit();
+
+    // Type check first
+    var tc = typecheck.typecheck(&program, allocator) catch |err| {
+        print("Type error: {any}\n", .{err});
+        return;
+    };
+    defer tc.deinit();
+
+    if (tc.errors.items.len > 0) {
+        print("Type errors - cannot compile:\n", .{});
+        for (tc.errors.items) |err| {
+            print("  Line {d}: {s}\n", .{ err.span.line, err.message });
+        }
+        return;
+    }
+
+    // Compile to HVM4
+    var book = parser.Book.init(allocator);
+    var compiler = compile.Compiler.init(allocator, &book);
+    defer compiler.deinit();
+
+    const term = compiler.compileProgram(&program) catch |err| {
+        print("Compile error: {any}\n", .{err});
+        return;
+    };
+
+    if (term) |t| {
+        // Pretty print the compiled term
+        const pretty = parser.pretty(allocator, t) catch {
+            print("Compiled successfully (cannot pretty print)\n", .{});
+            return;
+        };
+        defer allocator.free(pretty);
+
+        if (output_path) |out| {
+            const out_file = std.fs.cwd().createFile(out, .{}) catch |err| {
+                print("Error: cannot create output file: {any}\n", .{err});
+                return;
+            };
+            defer out_file.close();
+            out_file.writeAll(pretty) catch {};
+            print("Compiled to: {s}\n", .{out});
+        } else {
+            print("Compiled HVM4:\n{s}\n", .{pretty});
+        }
+    } else {
+        print("No main expression found\n", .{});
+    }
+}
+
+// =============================================================================
 // Main
 // =============================================================================
 
@@ -318,8 +512,32 @@ pub fn main() !void {
             return;
         }
 
+        // Check for .bend file
+        if (std.mem.endsWith(u8, cmd, ".bend")) {
+            try run_bend_file(allocator, cmd);
+            return;
+        }
+
         if (std.mem.eql(u8, cmd, "run") and args.len > 2) {
-            try run_file(allocator, args[2]);
+            const file_path = args[2];
+            if (std.mem.endsWith(u8, file_path, ".bend")) {
+                try run_bend_file(allocator, file_path);
+            } else {
+                try run_file(allocator, file_path);
+            }
+        } else if (std.mem.eql(u8, cmd, "check") and args.len > 2) {
+            // Type check a Bend file
+            try check_bend_file(allocator, args[2]);
+        } else if (std.mem.eql(u8, cmd, "compile") and args.len > 2) {
+            // Compile Bend to HVM
+            const output = if (args.len > 4 and std.mem.eql(u8, args[3], "-o"))
+                args[4]
+            else
+                null;
+            try compile_bend_file(allocator, args[2], output);
+        } else if (std.mem.eql(u8, cmd, "types") and args.len > 2) {
+            // Show inferred types
+            try check_bend_file(allocator, args[2]);
         } else if (std.mem.eql(u8, cmd, "eval") and args.len > 2) {
             try run_eval(allocator, args[2]);
         } else if (std.mem.eql(u8, cmd, "test")) {
@@ -2030,16 +2248,32 @@ fn print_help() void {
         \\Usage: hvm4 [command] [options]
         \\
         \\Commands:
-        \\  <file.hvm>      Run an HVM file directly
-        \\  run <file>      Run an HVM file
-        \\  eval "<expr>"   Evaluate a single expression
-        \\  parse           Run parser tests
-        \\  test            Run runtime tests
-        \\  bench           Run performance benchmark
-        \\  examples        Run example programs
-        \\  help            Show this help message
+        \\  <file.hvm>              Run an HVM file directly
+        \\  <file.bend>             Run a Bend file directly
+        \\  run <file>              Run an HVM or Bend file
+        \\  check <file.bend>       Type check a Bend file
+        \\  compile <file.bend>     Compile Bend to HVM (use -o for output)
+        \\  types <file.bend>       Show inferred types for a Bend file
+        \\  eval "<expr>"           Evaluate a single expression
+        \\  parse                   Run parser tests
+        \\  test                    Run runtime tests
+        \\  bench                   Run performance benchmark
+        \\  examples                Run example programs
+        \\  help                    Show this help message
         \\
-        \\HVM Syntax:
+        \\Bend Syntax (High-Level):
+        \\  type Name:              Define algebraic data type
+        \\    Ctor1 { field }         Constructor with fields
+        \\    Ctor2                   Nullary constructor
+        \\  def func(x): return x   Function definition (Imp style)
+        \\  func(x) = x             Function definition (Fun style)
+        \\  match x: case Ctor: ... Pattern matching
+        \\  fold x: case Ctor: ...  Recursive fold over data
+        \\  {a b c}                 Superposition (parallel values)
+        \\  if c then a else b      Conditional
+        \\  \x body                 Lambda abstraction
+        \\
+        \\HVM Syntax (Low-Level):
         \\  #42           Number
         \\  'c'           Character
         \\  *             Erasure
