@@ -313,8 +313,8 @@ pub const Lexer = struct {
             return self.scanSymbol(start, start_line, start_col);
         }
 
-        // Number
-        if (isDigit(c) or (c == '-' and self.peek() != null and isDigit(self.peek().?))) {
+        // Number (only scan '-' as part of number at start of expression, not after identifiers)
+        if (isDigit(c)) {
             return self.scanNumber(start, start_line, start_col);
         }
 
@@ -557,6 +557,12 @@ pub const Lexer = struct {
         const is_upper = first >= 'A' and first <= 'Z';
 
         while (self.peek()) |c| {
+            // Don't include '-' if followed by a digit (it's subtraction)
+            if (c == '-') {
+                if (self.peekN(1)) |next| {
+                    if (isDigit(next)) break;
+                }
+            }
             if (isIdentChar(c) or c == '/') {
                 _ = self.advance();
             } else {

@@ -252,12 +252,17 @@ fn run_file(allocator: std.mem.Allocator, path: []const u8) !void {
     const start = std.time.microTimestamp();
 
     // Parse and run
-    const term = parser.parse(allocator, content) catch |err| {
+    const term = parser.parseProgram(allocator, content) catch |err| {
         print("Parse error: {any}\n", .{err});
         return;
     };
 
-    const result = hvm.reduce(term);
+    if (term == null) {
+        print("Error: no main expression or @main() function defined\n", .{});
+        return;
+    }
+
+    const result = hvm.reduce(term.?);
 
     const end = std.time.microTimestamp();
 
@@ -270,6 +275,21 @@ fn run_file(allocator: std.mem.Allocator, path: []const u8) !void {
     };
     defer allocator.free(pretty_result);
     print("{s}\n", .{pretty_result});
+
+    // Debug: dump raw fields for constructors
+    const tag = hvm.term_tag(result);
+    const val = hvm.term_val(result);
+    if (tag >= hvm.C00 and tag <= hvm.C15) {
+        const arity = tag - hvm.C00;
+        print("DEBUG: Constructor C{d:0>2} arity={d} at loc={d}\n", .{ tag - hvm.C00, arity, val });
+        for (0..arity) |i| {
+            const field = hvm.got(val + i);
+            const ftag = hvm.term_tag(field);
+            const fext = hvm.term_ext(field);
+            const fval = hvm.term_val(field);
+            print("  field[{d}]: tag={d}, ext={d}, val={d}\n", .{ i, ftag, fext, fval });
+        }
+    }
 
     print("---\n", .{});
     print("Time: {d} us\n", .{end - start});
@@ -338,10 +358,13 @@ fn run_bend_file(allocator: std.mem.Allocator, path: []const u8) !void {
     };
 
     if (term) |t| {
+        // Use standard reduce
         const result = hvm.reduce(t);
         const end = std.time.microTimestamp();
 
-        // Print result
+        // Print result - show raw term structure first
+        print("Result (raw): tag={d}, ext={d}, val={d}\n", .{ hvm.term_tag(result), hvm.term_ext(result), hvm.term_val(result) });
+
         print("Result: ", .{});
         const pretty_result = parser.pretty(allocator, result) catch {
             show_term(result);
@@ -350,6 +373,26 @@ fn run_bend_file(allocator: std.mem.Allocator, path: []const u8) !void {
         };
         defer allocator.free(pretty_result);
         print("{s}\n", .{pretty_result});
+
+        // Debug: dump raw fields for constructors
+        const tag = hvm.term_tag(result);
+        const val = hvm.term_val(result);
+        if (tag >= hvm.C00 and tag <= hvm.C15) {
+            const arity = tag - hvm.C00;
+            print("DEBUG: Constructor C{d:0>2} arity={d} at loc={d}\n", .{ tag - hvm.C00, arity, val });
+            print("  Raw heap values:\n", .{});
+            for (0..arity) |i| {
+                const raw = hvm.hvm_get_state().heap[val + i];
+                print("    heap[{d}] = 0x{x:0>16}\n", .{ val + i, raw });
+            }
+            for (0..arity) |i| {
+                const field = hvm.got(val + i);
+                const ftag = hvm.term_tag(field);
+                const fext = hvm.term_ext(field);
+                const fval = hvm.term_val(field);
+                print("  field[{d}]: tag={d}(0x{x}), ext={d}, val={d}\n", .{ i, ftag, ftag, fext, fval });
+            }
+        }
 
         print("---\n", .{});
         print("Time: {d} us\n", .{end - start});

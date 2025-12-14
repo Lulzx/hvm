@@ -512,13 +512,30 @@ pub const Parser = struct {
 
                 try self.consume(':');
 
-                // Bind case variables
-                for (case_vars.items) |cv| {
-                    const cv_loc = hvm.alloc_node(1);
-                    try self.bindVar(cv, cv_loc);
+                // Allocate lambda locations for case variables
+                var lam_locs = try self.allocator.alloc(u64, case_vars.items.len);
+                defer self.allocator.free(lam_locs);
+
+                for (0..case_vars.items.len) |i| {
+                    lam_locs[i] = hvm.alloc_node(1);
                 }
 
-                const case_body = try self.term();
+                // Bind case variables to their lambda locations
+                for (case_vars.items, 0..) |cv, i| {
+                    try self.bindVar(cv, lam_locs[i]);
+                }
+
+                // Parse case body
+                var case_body = try self.term();
+
+                // Wrap body in lambdas (innermost first)
+                var i: usize = case_vars.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    hvm.set(lam_locs[i], case_body);
+                    case_body = hvm.term_new(hvm.LAM, 0, @truncate(lam_locs[i]));
+                }
+
                 try cases.append(self.allocator, case_body);
             }
             try self.consume('}');
@@ -838,6 +855,15 @@ pub const Parser = struct {
         if (self.peek() != null) {
             return try self.term();
         }
+
+        // If no main expression, try to call @main() if defined
+        if (self.book.get("main")) |main_func| {
+            // Create REF to main with no arguments
+            const loc = hvm.alloc_node(0);
+            hvm.hvm_get_state().fun_arity[main_func.fid] = 0;
+            return hvm.term_new(hvm.REF, main_func.fid, @truncate(loc));
+        }
+
         return null;
     }
 
