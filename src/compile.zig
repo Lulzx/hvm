@@ -34,6 +34,17 @@ pub const CtorInfo = struct {
 };
 
 // =============================================================================
+// Variable Use Tracking
+// =============================================================================
+
+const VarUseInfo = struct {
+    loc: u64, // Lambda slot location
+    total_uses: u32, // How many times this var is used total
+    current_use: u32, // Counter for which use we're on (0-indexed)
+    label: hvm.Ext, // Label for this var's duplication
+};
+
+// =============================================================================
 // Compiler State
 // =============================================================================
 
@@ -54,6 +65,9 @@ pub const Compiler = struct {
     scope: StringHashMap(u64), // Variable name -> heap location
     scope_stack: ArrayList(StringHashMap(u64)),
 
+    // Variable use tracking for duplication
+    var_uses: StringHashMap(VarUseInfo),
+
     // Label counter for superpositions
     next_label: hvm.Ext,
 
@@ -68,6 +82,7 @@ pub const Compiler = struct {
             .next_fid = 0x10,
             .scope = StringHashMap(u64).init(allocator),
             .scope_stack = .empty,
+            .var_uses = StringHashMap(VarUseInfo).init(allocator),
             .next_label = 0,
         };
     }
@@ -108,6 +123,7 @@ pub const Compiler = struct {
             s.deinit();
         }
         self.scope_stack.deinit(self.allocator);
+        self.var_uses.deinit();
     }
 
     // =========================================================================
@@ -146,6 +162,198 @@ pub const Compiler = struct {
         const lab = self.next_label;
         self.next_label += 1;
         return lab;
+    }
+
+    /// Build duplication access for multi-use variables
+    /// For multi-use, we use CO0/CO1 which properly interact with values:
+    /// - CO0/CO1 read from the slot and trigger interaction rules
+    /// - Interaction stores result with SUB_BIT for sibling projector
+    /// - All siblings pointing to same slot get the shared value
+    fn buildDupAccess(self: *Compiler, loc: u64, total: u32, use_idx: u32, base_label: hvm.Ext) hvm.Term {
+        _ = self;
+        if (total <= 1) {
+            // Single use - no duplication needed
+            return hvm.term_new(hvm.VAR, 0, @truncate(loc));
+        }
+        // For multi-use: use CO0 and CO1 with unique labels
+        // Both point to the same LAM slot
+        // When APP-LAM fires, the argument is stored with SUB_BIT
+        // CO0/CO1 will then read the substituted value
+        const tag: hvm.Tag = if ((use_idx & 1) == 0) hvm.CO0 else hvm.CO1;
+        return hvm.term_new(tag, base_label, @truncate(loc));
+    }
+
+    // =========================================================================
+    // Variable Use Counting
+    // =========================================================================
+
+    /// Count uses of a variable in a list of statements
+    fn countVarUsesInStmts(name: []const u8, stmts: []const ast.Stmt) u32 {
+        var count: u32 = 0;
+        for (stmts) |stmt| {
+            count += countVarUsesInStmt(name, &stmt);
+        }
+        return count;
+    }
+
+    fn countVarUsesInStmt(name: []const u8, stmt: *const ast.Stmt) u32 {
+        switch (stmt.*) {
+            .return_ => |ret| {
+                if (ret.value) |v| return countVarUsesInExpr(name, v);
+                return 0;
+            },
+            .assign => |a| {
+                // Just count uses in the value expression
+                // (body is handled by sequential processing in countVarUsesInStmts)
+                return countVarUsesInExpr(name, a.value);
+            },
+            .let_ => |l| {
+                return countVarUsesInExpr(name, l.value);
+            },
+            .if_ => |i| {
+                // Conditions are always checked (until one is true), but only one body executes
+                var cond_uses: u32 = 0;
+                var max_body: u32 = 0;
+                for (i.branches) |b| {
+                    cond_uses += countVarUsesInExpr(name, b.cond);
+                    const body_uses = countVarUsesInStmts(name, b.body);
+                    if (body_uses > max_body) max_body = body_uses;
+                }
+                if (i.else_body) |eb| {
+                    const else_uses = countVarUsesInStmts(name, eb);
+                    if (else_uses > max_body) max_body = else_uses;
+                }
+                return cond_uses + max_body;
+            },
+            .switch_ => |s| {
+                // Only one case executes, so take MAX across cases, not sum
+                const scrutinee_uses = countVarUsesInExpr(name, s.scrutinee);
+                var max_case: u32 = 0;
+                for (s.cases) |c| {
+                    const case_uses = countVarUsesInStmts(name, c.body);
+                    if (case_uses > max_case) max_case = case_uses;
+                }
+                return scrutinee_uses + max_case;
+            },
+            .match_ => |m| {
+                // Only one case executes, so take MAX across cases, not sum
+                const scrutinee_uses = countVarUsesInExpr(name, m.scrutinee);
+                var max_case: u32 = 0;
+                for (m.cases) |c| {
+                    const case_uses = countVarUsesInStmts(name, c.body);
+                    if (case_uses > max_case) max_case = case_uses;
+                }
+                return scrutinee_uses + max_case;
+            },
+            .fold_ => |f| {
+                // Only one case executes, so take MAX across cases, not sum
+                const scrutinee_uses = countVarUsesInExpr(name, f.scrutinee);
+                var max_case: u32 = 0;
+                for (f.cases) |c| {
+                    const case_uses = countVarUsesInStmts(name, c.body);
+                    if (case_uses > max_case) max_case = case_uses;
+                }
+                return scrutinee_uses + max_case;
+            },
+            .expr => |e| return countVarUsesInExpr(name, e),
+            else => return 0,
+        }
+    }
+
+    fn countVarUsesInExpr(name: []const u8, expr: *const ast.Expr) u32 {
+        switch (expr.kind) {
+            .var_ => |v| {
+                return if (std.mem.eql(u8, v, name)) 1 else 0;
+            },
+            .number, .char_, .string, .symbol, .nat, .constructor, .era, .hole => return 0,
+            .lambda => |l| {
+                // Check if lambda binds this name (shadows it)
+                for (l.params) |p| {
+                    if (std.mem.eql(u8, p, name)) return 0;
+                }
+                return countVarUsesInExpr(name, l.body);
+            },
+            .app => |a| {
+                var count = countVarUsesInExpr(name, a.func);
+                for (a.args) |arg| count += countVarUsesInExpr(name, arg);
+                return count;
+            },
+            .binop => |b| {
+                return countVarUsesInExpr(name, b.left) + countVarUsesInExpr(name, b.right);
+            },
+            .unop => |u| return countVarUsesInExpr(name, u.operand),
+            .if_ => |i| {
+                // Condition is always evaluated, but only one branch is taken
+                const cond_uses = countVarUsesInExpr(name, i.cond);
+                const then_uses = countVarUsesInExpr(name, i.then_);
+                const else_uses = countVarUsesInExpr(name, i.else_);
+                return cond_uses + @max(then_uses, else_uses);
+            },
+            .let_ => |l| {
+                var count = countVarUsesInExpr(name, l.value);
+                // Check if let binds this name
+                if (l.pattern.kind == .var_) {
+                    if (std.mem.eql(u8, l.pattern.kind.var_, name)) return count;
+                }
+                count += countVarUsesInExpr(name, l.body);
+                return count;
+            },
+            .tuple => |t| {
+                var count: u32 = 0;
+                for (t) |e| count += countVarUsesInExpr(name, e);
+                return count;
+            },
+            .list => |li| {
+                var count: u32 = 0;
+                for (li) |e| count += countVarUsesInExpr(name, e);
+                return count;
+            },
+            .superposition => |s| {
+                var count: u32 = 0;
+                for (s) |e| count += countVarUsesInExpr(name, e);
+                return count;
+            },
+            .match_ => |m| {
+                var count = countVarUsesInExpr(name, m.scrutinee);
+                for (m.cases) |c| {
+                    count += countVarUsesInExpr(name, c.body);
+                }
+                return count;
+            },
+            .fold_ => |f| {
+                var count = countVarUsesInExpr(name, f.scrutinee);
+                for (f.cases) |c| {
+                    count += countVarUsesInExpr(name, c.body);
+                }
+                return count;
+            },
+            .switch_ => |sw| {
+                var count = countVarUsesInExpr(name, sw.scrutinee);
+                for (sw.cases) |c| {
+                    count += countVarUsesInExpr(name, c.body);
+                }
+                return count;
+            },
+            .use_ => |u| {
+                return countVarUsesInExpr(name, u.value) + countVarUsesInExpr(name, u.body);
+            },
+            .bend_ => |bend| {
+                var count: u32 = 0;
+                for (bend.bindings) |b| count += countVarUsesInExpr(name, b.init);
+                count += countVarUsesInExpr(name, bend.when_cond);
+                count += countVarUsesInExpr(name, bend.when_body);
+                count += countVarUsesInExpr(name, bend.else_body);
+                return count;
+            },
+            .field_access => |fa| return countVarUsesInExpr(name, fa.value),
+            .fork => |f| return countVarUsesInExpr(name, f),
+        }
+    }
+
+    /// Count uses of a variable from a specific statement index onward
+    fn countVarUsesFromIdx(name: []const u8, stmts: []const ast.Stmt, start_idx: usize) u32 {
+        if (start_idx >= stmts.len) return 0;
+        return countVarUsesInStmts(name, stmts[start_idx..]);
     }
 
     // =========================================================================
@@ -281,9 +489,25 @@ pub const Compiler = struct {
             param_locs[i] = hvm.alloc_node(1);
         }
 
-        // Bind parameters to their lambda locations
+        // Count parameter uses in body and bind parameters
         for (funcdef.params, 0..) |param, i| {
             try self.bindVar(param.name, param_locs[i]);
+
+            // Count uses of this parameter in the function body
+            const uses = switch (funcdef.body) {
+                .expr => |expr| countVarUsesInExpr(param.name, expr),
+                .stmts => |stmts| countVarUsesInStmts(param.name, stmts),
+            };
+
+            // Register multi-use info if parameter is used more than once
+            if (uses > 1) {
+                try self.var_uses.put(param.name, .{
+                    .loc = param_locs[i],
+                    .total_uses = uses,
+                    .current_use = 0,
+                    .label = self.freshLabel(),
+                });
+            }
         }
 
         // Compile body
@@ -291,6 +515,11 @@ pub const Compiler = struct {
             .expr => |expr| try self.compileExpr(expr),
             .stmts => |stmts| try self.compileStmts(stmts),
         };
+
+        // Clean up var_uses for parameters
+        for (funcdef.params) |param| {
+            _ = self.var_uses.remove(param.name);
+        }
 
         // Wrap body in lambdas for each parameter (innermost first, so iterate reverse)
         var i: usize = funcdef.params.len;
@@ -313,50 +542,185 @@ pub const Compiler = struct {
     // =========================================================================
 
     fn compileStmts(self: *Compiler, stmts: []const ast.Stmt) CompileError!hvm.Term {
-        if (stmts.len == 0) {
+        return self.compileStmtsFrom(stmts, 0);
+    }
+
+    fn compileStmtsFrom(self: *Compiler, stmts: []const ast.Stmt, start_idx: usize) CompileError!hvm.Term {
+        if (start_idx >= stmts.len) {
             return hvm.term_new(hvm.ERA, 0, 0);
         }
 
-        // Find return statement and compile accordingly
-        for (stmts) |stmt| {
-            switch (stmt) {
-                .return_ => |ret| {
-                    if (ret.value) |value| {
-                        return self.compileExpr(value);
-                    }
-                    return hvm.term_new(hvm.ERA, 0, 0);
-                },
-                .assign => |assign| {
-                    // Compile value and bind
-                    const value = try self.compileExpr(assign.value);
-                    try self.bindPattern(assign.pattern, value);
-                },
-                .let_ => |let_| {
-                    const value = try self.compileExpr(let_.value);
-                    try self.bindPattern(let_.pattern, value);
-                },
-                .if_ => |if_stmt| {
-                    return self.compileIfStmt(&if_stmt);
-                },
-                .match_ => |match_stmt| {
-                    return self.compileMatchStmt(&match_stmt);
-                },
-                .switch_ => |switch_stmt| {
-                    return self.compileSwitchStmt(&switch_stmt);
-                },
-                .fold_ => |fold_stmt| {
-                    return self.compileFoldStmt(&fold_stmt);
-                },
-                .expr => |expr| {
-                    // Expression statement - just compile it
-                    _ = try self.compileExpr(expr);
-                },
-                else => {},
-            }
+        const stmt = stmts[start_idx];
+        switch (stmt) {
+            .return_ => |ret| {
+                if (ret.value) |value| {
+                    return self.compileExpr(value);
+                }
+                return hvm.term_new(hvm.ERA, 0, 0);
+            },
+            .assign => |assign| {
+                // Compile value
+                const value = try self.compileExpr(assign.value);
+                // Compile the rest as the continuation
+                return self.compilePatternBinding(assign.pattern, value, stmts, start_idx + 1);
+            },
+            .let_ => |let_| {
+                const value = try self.compileExpr(let_.value);
+                return self.compilePatternBinding(let_.pattern, value, stmts, start_idx + 1);
+            },
+            .if_ => |if_stmt| {
+                return self.compileIfStmt(&if_stmt);
+            },
+            .match_ => |match_stmt| {
+                return self.compileMatchStmt(&match_stmt);
+            },
+            .switch_ => |switch_stmt| {
+                return self.compileSwitchStmt(&switch_stmt);
+            },
+            .fold_ => |fold_stmt| {
+                return self.compileFoldStmt(&fold_stmt);
+            },
+            .expr => |expr| {
+                // Expression statement - compile and continue
+                _ = try self.compileExpr(expr);
+                return self.compileStmtsFrom(stmts, start_idx + 1);
+            },
+            else => {
+                return self.compileStmtsFrom(stmts, start_idx + 1);
+            },
         }
+    }
 
-        // No explicit return - return erasure
-        return hvm.term_new(hvm.ERA, 0, 0);
+    /// Compile pattern binding with continuation
+    fn compilePatternBinding(self: *Compiler, pattern: *const ast.Pattern, value: hvm.Term, stmts: []const ast.Stmt, next_idx: usize) CompileError!hvm.Term {
+        switch (pattern.kind) {
+            .var_ => |name| {
+                // Count how many times this variable is used in the continuation
+                const uses = countVarUsesFromIdx(name, stmts, next_idx);
+
+                // Simple variable binding: create a lambda and apply
+                try self.pushScope();
+
+                const lam_loc = hvm.alloc_node(1);
+                try self.bindVar(name, lam_loc);
+
+                // Register variable use info for duplication tracking
+                try self.var_uses.put(name, .{
+                    .loc = lam_loc,
+                    .total_uses = uses,
+                    .current_use = 0,
+                    .label = self.freshLabel(),
+                });
+
+                const body = try self.compileStmtsFrom(stmts, next_idx);
+
+                // Clean up var use tracking
+                _ = self.var_uses.remove(name);
+
+                self.popScope();
+
+                hvm.set(lam_loc, body);
+
+                const lam = hvm.term_new(hvm.LAM, 0, @truncate(lam_loc));
+
+                // Apply the lambda to the value
+                const app_loc = hvm.alloc_node(2);
+                hvm.set(app_loc, lam);
+                hvm.set(app_loc + 1, value);
+                return hvm.term_new(hvm.APP, 0, @truncate(app_loc));
+            },
+            .wildcard => {
+                // Just continue with next statements
+                return self.compileStmtsFrom(stmts, next_idx);
+            },
+            .tuple => |pats| {
+                // Compile as MAT on the tuple constructor
+                // The tuple has constructor ID 0, arity = len(pats)
+                try self.pushScope();
+                defer self.popScope();
+
+                // Create lambdas for each tuple element
+                var lam_locs = try self.allocator.alloc(u64, pats.len);
+                defer self.allocator.free(lam_locs);
+
+                for (0..pats.len) |i| {
+                    lam_locs[i] = hvm.alloc_node(1);
+                }
+
+                // Bind pattern names to lambda locations
+                for (pats, 0..) |p, i| {
+                    if (p.kind == .var_) {
+                        try self.bindVar(p.kind.var_, lam_locs[i]);
+                    }
+                }
+
+                // Compile the continuation body
+                var body = try self.compileStmtsFrom(stmts, next_idx);
+
+                // Wrap in lambdas (innermost first)
+                var i: usize = pats.len;
+                while (i > 0) {
+                    i -= 1;
+                    hvm.set(lam_locs[i], body);
+                    body = hvm.term_new(hvm.LAM, 0, @truncate(lam_locs[i]));
+                }
+
+                // Create MAT node with one case (constructor ID 0)
+                const mat_loc = hvm.alloc_node(2);
+                hvm.set(mat_loc, value);
+                hvm.set(mat_loc + 1, body); // Case for constructor 0
+
+                return hvm.term_new(hvm.MAT, 1, @truncate(mat_loc));
+            },
+            .constructor => |ctor| {
+                // Similar to tuple but with named constructor
+                const info = self.ctors.get(ctor.name) orelse return CompileError.UndefinedConstructor;
+
+                try self.pushScope();
+                defer self.popScope();
+
+                var lam_locs = try self.allocator.alloc(u64, ctor.fields.len);
+                defer self.allocator.free(lam_locs);
+
+                for (0..ctor.fields.len) |i| {
+                    lam_locs[i] = hvm.alloc_node(1);
+                }
+
+                for (ctor.fields, 0..) |field, i| {
+                    if (field.pattern.kind == .var_) {
+                        try self.bindVar(field.pattern.kind.var_, lam_locs[i]);
+                    }
+                }
+
+                var body = try self.compileStmtsFrom(stmts, next_idx);
+
+                var j: usize = ctor.fields.len;
+                while (j > 0) {
+                    j -= 1;
+                    hvm.set(lam_locs[j], body);
+                    body = hvm.term_new(hvm.LAM, 0, @truncate(lam_locs[j]));
+                }
+
+                // MAT with case at constructor's index
+                const num_cases = info.id + 1;
+                const mat_loc = hvm.alloc_node(1 + num_cases);
+                hvm.set(mat_loc, value);
+
+                // Fill with erasures for missing cases
+                for (0..num_cases) |k| {
+                    if (k == info.id) {
+                        hvm.set(mat_loc + 1 + k, body);
+                    } else {
+                        hvm.set(mat_loc + 1 + k, hvm.term_new(hvm.ERA, 0, 0));
+                    }
+                }
+
+                return hvm.term_new(hvm.MAT, @intCast(num_cases), @truncate(mat_loc));
+            },
+            else => {
+                return self.compileStmtsFrom(stmts, next_idx);
+            },
+        }
     }
 
     fn compileIfStmt(self: *Compiler, if_stmt: *const ast.IfStmtPayload) CompileError!hvm.Term {
@@ -532,6 +896,22 @@ pub const Compiler = struct {
         switch (expr.kind) {
             .var_ => |name| {
                 if (self.lookupVar(name)) |loc| {
+                    // Check if this variable needs duplication
+                    if (self.var_uses.getPtr(name)) |info| {
+                        if (info.total_uses > 1) {
+                            // Multi-use variable: generate duplication structure
+                            // For N uses, we create a binary tree of dups
+                            // Use CO0 for "first half" uses, CO1 for "second half"
+                            const use_idx = info.current_use;
+                            info.current_use += 1;
+
+                            // Build the path through the dup tree
+                            // For 2 uses: use 0 -> CO0, use 1 -> CO1
+                            // For 3 uses: use 0 -> CO0, use 1 -> CO0 of CO1, use 2 -> CO1 of CO1
+                            // For 4 uses: similar binary tree
+                            return self.buildDupAccess(loc, info.total_uses, use_idx, info.label);
+                        }
+                    }
                     return hvm.term_new(hvm.VAR, 0, @truncate(loc));
                 }
                 // Check if it's a function reference
@@ -540,6 +920,7 @@ pub const Compiler = struct {
                     const loc = hvm.alloc_node(0);
                     return hvm.term_new(hvm.REF, fid, @truncate(loc));
                 }
+                std.debug.print("Undefined variable: {s}\n", .{name});
                 return CompileError.UndefinedVariable;
             },
 

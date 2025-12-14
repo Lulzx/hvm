@@ -441,14 +441,48 @@ pub const State = struct {
 };
 
 /// Generic function dispatch - retrieves body from HVM state and copies it
+/// For Bend: Arguments are applied via APP nodes (ref_val=0, arity stored in fun_arity)
+/// For HVM parser: Arguments stored at heap[ref_val..ref_val+arity]
 pub fn funcDispatch(ref: Term) Term {
     const fid = term_ext(ref);
+    const ref_val = term_val(ref);
+    const arity = HVM.fun_arity[fid];
     const body = HVM.func_bodies[fid];
+
+    if (debug_reduce) {
+        std.debug.print("funcDispatch: fid={}, ref_val={}, arity={}, body tag=0x{x} val={}\n", .{ fid, ref_val, arity, term_tag(body), term_val(body) });
+    }
+
     // Deep copy the term to get fresh heap locations for each call
-    // Use a simple array to map old locations to new locations
     var loc_map: [256]u64 = [_]u64{0} ** 256;
     var map_count: usize = 0;
-    return copyTermWithMap(body, &loc_map, &map_count);
+    var result = copyTermWithMap(body, &loc_map, &map_count);
+
+    if (debug_reduce) {
+        std.debug.print("funcDispatch: after copy, result tag=0x{x} val={}, map_count={}\n", .{ term_tag(result), term_val(result), map_count });
+        for (0..map_count) |i| {
+            const idx = i * 2;
+            if (idx + 1 < 256) {
+                std.debug.print("  map[{}]: {} -> {}\n", .{ i, loc_map[idx], loc_map[idx + 1] });
+            }
+        }
+    }
+
+    // If arguments are stored at ref_val (HVM parser style), apply them
+    // If ref_val is 0 or small, arguments come from APP nodes (Bend style)
+    if (ref_val > 0 and arity > 0) {
+        // HVM parser style: arguments at heap[ref_val]
+        for (0..arity) |i| {
+            const arg = HVM.heap[ref_val + i];
+            const app_loc = alloc(2);
+            HVM.heap[app_loc] = result;
+            HVM.heap[app_loc + 1] = arg;
+            result = term_new(APP, 0, app_loc);
+        }
+    }
+    // Bend style: arguments will be applied via APP nodes, just return the body
+
+    return result;
 }
 
 /// Deep copy a term, allocating fresh heap locations and remapping VARs
@@ -472,6 +506,9 @@ fn copyTermWithMap(term: Term, loc_map: *[256]u64, map_count: *usize) Term {
                     loc_map[idx] = val;
                     loc_map[idx + 1] = new_loc;
                     map_count.* += 1;
+                    if (debug_reduce) {
+                        std.debug.print("  copyTerm LAM: old_loc={} -> new_loc={}\n", .{ val, new_loc });
+                    }
                 }
             }
             const body = HVM.heap[val];
@@ -524,10 +561,16 @@ fn copyTermWithMap(term: Term, loc_map: *[256]u64, map_count: *usize) Term {
             for (0..map_count.*) |i| {
                 const idx = i * 2;
                 if (idx + 1 < 256 and loc_map[idx] == val) {
+                    if (debug_reduce) {
+                        std.debug.print("  copyTerm VAR({}) -> VAR({})\n", .{ val, loc_map[idx + 1] });
+                    }
                     return term_new(VAR, ext, @truncate(loc_map[idx + 1]));
                 }
             }
             // Not found in map - return as-is
+            if (debug_reduce) {
+                std.debug.print("  copyTerm VAR({}) NOT FOUND in map (map_count={})\n", .{ val, map_count.* });
+            }
             return term;
         },
 
@@ -548,6 +591,19 @@ fn copyTermWithMap(term: Term, loc_map: *[256]u64, map_count: *usize) Term {
             HVM.heap[new_loc] = copyTermWithMap(HVM.heap[val], loc_map, map_count);
             HVM.heap[new_loc + 1] = copyTermWithMap(HVM.heap[val + 1], loc_map, map_count);
             return term_new(P02, ext, @truncate(new_loc));
+        },
+
+        // CO0/CO1: remap to new location if it was copied (like VAR)
+        CO0, CO1 => {
+            // Look up the old location in the map
+            for (0..map_count.*) |i| {
+                const idx = i * 2;
+                if (idx + 1 < 256 and loc_map[idx] == val) {
+                    return term_new(tag, ext, @truncate(loc_map[idx + 1]));
+                }
+            }
+            // Not found in map - return as-is
+            return term;
         },
 
         // Default: just return as-is
@@ -611,6 +667,9 @@ pub inline fn got(loc: u64) Term {
 
 /// Write to heap
 pub inline fn set(loc: u64, term: Term) void {
+    if (debug_reduce and (loc == 390 or loc == 391)) {
+        std.debug.print("HEAP WRITE: loc={d}, term=0x{x}\n", .{ loc, term });
+    }
     HVM.heap[loc] = term;
 }
 
@@ -663,6 +722,9 @@ inline fn interact_app_lam(app_loc: Val, lam_loc: Val) Term {
     HVM.interactions += 1;
     const arg = HVM.heap[app_loc + 1];
     const bod = HVM.heap[lam_loc];
+    if (debug_reduce) {
+        std.debug.print("APP+LAM: lam_loc={d}, arg tag=0x{x} val={d}, bod tag=0x{x} val={d}\n", .{ lam_loc, term_tag(arg), term_val(arg), term_tag(bod), term_val(bod) });
+    }
     HVM.heap[lam_loc] = term_set_sub(arg);
     return bod;
 }
@@ -778,6 +840,37 @@ inline fn interact_dup_sup(dup_tag: Tag, dup_loc: Val, dup_lab: Ext, sup_loc: Va
     }
 }
 
+/// DUP + APP: Duplicate application
+/// CO0(APP(f,x)) => APP(CO0(f), CO0(x))
+fn interact_dup_app(dup_tag: Tag, dup_loc: Val, dup_lab: Ext, app_loc: Val) Term {
+    HVM.interactions += 1;
+
+    // Allocate: 2 dups + 2 app0 + 2 app1 = 6 slots
+    const base = alloc(6);
+    const dups_loc = base;
+    const app0_loc = base + 2;
+    const app1_loc = base + 4;
+
+    // Copy APP fields (func, arg) to dup slots
+    HVM.heap[dups_loc] = HVM.heap[app_loc]; // func
+    HVM.heap[dups_loc + 1] = HVM.heap[app_loc + 1]; // arg
+
+    // Create CO0/CO1 projections for both APPs
+    HVM.heap[app0_loc] = term_new(CO0, dup_lab, @truncate(dups_loc));
+    HVM.heap[app0_loc + 1] = term_new(CO0, dup_lab, @truncate(dups_loc + 1));
+    HVM.heap[app1_loc] = term_new(CO1, dup_lab, @truncate(dups_loc));
+    HVM.heap[app1_loc + 1] = term_new(CO1, dup_lab, @truncate(dups_loc + 1));
+
+    if (dup_tag == CO0) {
+        @branchHint(.likely);
+        HVM.heap[dup_loc] = term_set_sub(term_new(APP, 0, app1_loc));
+        return term_new(APP, 0, app0_loc);
+    } else {
+        HVM.heap[dup_loc] = term_set_sub(term_new(APP, 0, app0_loc));
+        return term_new(APP, 0, app1_loc);
+    }
+}
+
 /// DUP + NUM: Both projections get the number
 inline fn interact_dup_num(dup_loc: Val, num: Term) Term {
     HVM.interactions += 1;
@@ -831,6 +924,15 @@ fn interact_mat_ctr(mat_loc: Val, ctr_tag: Tag, ctr_loc: Val, ctr_ext: Ext) Term
     // Get the case branch
     var branch = HVM.heap[mat_loc + 1 + case_idx];
 
+    if (debug_reduce) {
+        std.debug.print("MAT+CTR: ctr_tag=0x{x}, arity={d}, case_idx={d}\n", .{ ctr_tag, arity, case_idx });
+        std.debug.print("  branch: tag=0x{x}, ext={d}, val={d}\n", .{ term_tag(branch), term_ext(branch), term_val(branch) });
+        for (0..arity) |i| {
+            const field = HVM.heap[ctr_loc + i];
+            std.debug.print("  field[{d}]: tag=0x{x}, ext={d}, val={d}\n", .{ i, term_tag(field), term_ext(field), term_val(field) });
+        }
+    }
+
     // Apply constructor fields to branch
     for (0..arity) |i| {
         const field = HVM.heap[ctr_loc + i];
@@ -838,6 +940,10 @@ fn interact_mat_ctr(mat_loc: Val, ctr_tag: Tag, ctr_loc: Val, ctr_ext: Ext) Term
         HVM.heap[app_loc] = branch;
         HVM.heap[app_loc + 1] = field;
         branch = term_new(APP, 0, app_loc);
+    }
+
+    if (debug_reduce) {
+        std.debug.print("  result: tag=0x{x}, ext={d}, val={d}\n", .{ term_tag(branch), term_ext(branch), term_val(branch) });
     }
 
     return branch;
@@ -1261,6 +1367,11 @@ fn wrap_dup_ctr(p_val: Val, p_ext: Ext, val: Val, ext: Ext, p_tag: Tag, tag: Tag
     return interact_dup_ctr(p_tag, p_val, p_ext, tag, val, ext);
 }
 
+/// Wrapper for CO0/CO1 + APP (needs stack sync - handled in reduce)
+fn wrap_dup_app(p_val: Val, p_ext: Ext, val: Val, _: Ext, p_tag: Tag, _: Tag, _: Term) Term {
+    return interact_dup_app(p_tag, p_val, p_ext, val);
+}
+
 /// Wrapper for MAT + CTR (needs stack sync - handled in reduce)
 fn wrap_mat_ctr(p_val: Val, _: Ext, val: Val, ext: Ext, _: Tag, tag: Tag, _: Term) Term {
     return interact_mat_ctr(p_val, tag, val, ext);
@@ -1274,10 +1385,11 @@ fn wrap_swi_num(p_val: Val, _: Ext, val: Val, _: Ext, _: Tag, _: Tag, _: Term) T
 /// Interaction requires stack synchronization (calls alloc/reduce internally)
 const NeedsSync = struct {
     fn check(p_tag: Tag, tag: Tag) bool {
-        // APP+SUP, CO*+LAM, CO*+CTR, MAT+CTR, SWI+NUM all allocate
+        // APP+SUP, CO*+LAM, CO*+CTR, CO*+APP, MAT+CTR, SWI+NUM all allocate
         if (p_tag == APP and tag == SUP) return true;
         if ((p_tag == CO0 or p_tag == CO1) and tag == LAM) return true;
         if ((p_tag == CO0 or p_tag == CO1) and tag >= C00 and tag <= C15) return true;
+        if ((p_tag == CO0 or p_tag == CO1) and tag == APP) return true;
         if (p_tag == MAT and tag >= C00 and tag <= C15) return true;
         if (p_tag == SWI and tag == NUM) return true;
         return false;
@@ -1298,12 +1410,14 @@ const interaction_table: [256][256]?InteractFn = blk: {
     table[CO0][NUM] = wrap_dup_num;
     table[CO0][ERA] = wrap_dup_era;
     table[CO0][LAM] = wrap_dup_lam;
+    table[CO0][APP] = wrap_dup_app;
 
     // CO1 interactions
     table[CO1][SUP] = wrap_dup_sup;
     table[CO1][NUM] = wrap_dup_num;
     table[CO1][ERA] = wrap_dup_era;
     table[CO1][LAM] = wrap_dup_lam;
+    table[CO1][APP] = wrap_dup_app;
 
     // CO0/CO1 + CTR interactions (all 16 constructors)
     for ([_]Tag{ C00, C01, C02, C03, C04, C05, C06, C07, C08, C09, C10, C11, C12, C13, C14, C15 }) |ctr| {
@@ -1327,19 +1441,30 @@ const interaction_table: [256][256]?InteractFn = blk: {
 // =============================================================================
 
 /// Main reduction function with cached pointers and inlined hot paths
+var debug_reduce: bool = false;
+
 pub noinline fn reduce(term: Term) Term {
     const heap = HVM.heap;
     const stack = HVM.stack;
     const stop = HVM.stack_pos;
     var spos = stop;
     var next = term;
+    var steps: u64 = 0;
 
     while (true) {
-        // Handle substitution
+        steps += 1;
+        if (debug_reduce and steps < 200) {
+            print("  [{d}] tag={d}, ext={d}, val={d}, spos={d}", .{ steps, term_tag(next), term_ext(next), term_val(next), spos });
+            if ((next & SUB_BIT) != 0) print(" [SUB]", .{});
+            print("\n", .{});
+        }
+        // Removed infinite loop detection
+
+        // Handle substitution - SUB_BIT marks this is a substituted value
+        // Just clear the bit and continue with the value
         if ((next & SUB_BIT) != 0) {
             @branchHint(.likely);
-            const loc = term_val(next);
-            next = heap[loc];
+            next = next & ~SUB_BIT;
             continue;
         }
 
@@ -1355,14 +1480,11 @@ pub noinline fn reduce(term: Term) Term {
                     next = next & ~SUB_BIT;
                     continue;
                 }
-                if (spos > stop) {
-                    spos -= 1;
-                    const prev = stack[spos];
-                    heap[term_val(prev)] = next;
-                    next = prev;
-                } else {
-                    break;
-                }
+                // VAR points to unreduced content
+                // Push VAR to stack so we can store result back when done
+                stack[spos] = term_new(VAR, 0, val);
+                spos += 1;
+                continue;
             },
 
             // Collapse projections
@@ -1461,6 +1583,10 @@ pub noinline fn reduce(term: Term) Term {
 
             // Values: interact with stack top
             LAM, SUP, ERA, NUM, C00, C01, C02, C03, C04, C05, C06, C07, C08, C09, C10, C11, C12, C13, C14, C15 => {
+                // Debug: for C02, print fields
+                if (debug_reduce and tag == C02) {
+                    std.debug.print("C02 at {d}: heap[{d}]=0x{x}, heap[{d}+1]=0x{x}\n", .{ val, val, heap[val], val, heap[val + 1] });
+                }
                 if (spos <= stop) {
                     @branchHint(.unlikely);
                     break;
@@ -1483,6 +1609,13 @@ pub noinline fn reduce(term: Term) Term {
                     } else {
                         next = interact_fn(p_val, p_ext, val, ext, p_tag, tag, next);
                     }
+                    continue;
+                }
+
+                // VAR on stack: store the reduced result at VAR's location
+                if (p_tag == VAR) {
+                    heap[p_val] = term_set_sub(next);
+                    // Continue with the value (don't pop - already popped)
                     continue;
                 }
 
