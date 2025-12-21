@@ -82,6 +82,15 @@ zig build -Doptimize=ReleaseFast
 ./zig-out/bin/hvm4 examples
 ```
 
+### Runtime options
+
+- `--reduce=<standard|fast|compiled>` selects the reducer (experimental reducers may use significantly more heap on some programs).
+- `--stats` prints heap usage stats after a run.
+- `--heap=<n>` / `--stack=<n>` set heap/stack capacity in term slots (supports `K`/`M`/`G` suffixes).
+- `--workers=<n>` sets the worker count used by batch-parallel benchmarks/ops.
+
+Note: multicore/GPU acceleration in this repo currently targets batch operations and microbenchmarks; program evaluation still uses the selected reducer on a single term.
+
 ## Syntax
 
 | Syntax | Description | Example |

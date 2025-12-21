@@ -130,6 +130,7 @@ const Selectors = struct {
     // NSString
     stringWithUTF8String: SEL = null,
     UTF8String: SEL = null,
+    localizedDescription: SEL = null,
 
     // Memory
     release: SEL = null,
@@ -155,6 +156,7 @@ const Selectors = struct {
             .endEncoding = sel_registerName("endEncoding"),
             .stringWithUTF8String = sel_registerName("stringWithUTF8String:"),
             .UTF8String = sel_registerName("UTF8String"),
+            .localizedDescription = sel_registerName("localizedDescription"),
             .release = sel_registerName("release"),
         };
     }
@@ -174,21 +176,107 @@ const shader_source =
     \\#define TAG_MASK  0xFF00000000000000ULL
     \\#define EXT_MASK  0x00FFFFFF00000000ULL
     \\#define VAL_MASK  0x00000000FFFFFFFFULL
-    \\#define GET_TAG(t) ((t >> 56) & 0xFF)
-    \\#define GET_EXT(t) ((t >> 32) & 0xFFFFFF)
-    \\#define GET_VAL(t) (t & 0xFFFFFFFF)
+    \\#define SUB_BIT   0x8000000000000000ULL
+    \\#define TERM_CLR_SUB(t) ((t) & ~SUB_BIT)
+    \\#define TERM_IS_SUB(t) ((t) & SUB_BIT)
+    \\#define GET_TAG(t) ((TERM_CLR_SUB(t) >> 56) & 0xFF)
+    \\#define GET_EXT(t) ((TERM_CLR_SUB(t) >> 32) & 0xFFFFFF)
+    \\#define GET_VAL(t) ((t) & 0xFFFFFFFF)
     \\#define MAKE_TERM(tag, ext, val) (((ulong)(tag) << 56) | ((ulong)(ext) << 32) | (ulong)(val))
     \\
-    \\// Term tags
-    \\#define TAG_ERA 0x00
-    \\#define TAG_REF 0x01
-    \\#define TAG_NUM 0x02
-    \\#define TAG_LAM 0x10
-    \\#define TAG_APP 0x11
-    \\#define TAG_SUP 0x12
-    \\#define TAG_CO0 0x13
-    \\#define TAG_CO1 0x14
-    \\#define TAG_VAR 0x1F
+    \\// Term tags (HVM4)
+    \\#define TAG_APP 0x00
+    \\#define TAG_VAR 0x01
+    \\#define TAG_LAM 0x02
+    \\#define TAG_CO0 0x03
+    \\#define TAG_CO1 0x04
+    \\#define TAG_SUP 0x05
+    \\#define TAG_DUP 0x06
+    \\#define TAG_REF 0x07
+    \\#define TAG_ERA 0x08
+    \\#define TAG_RED 0x09
+    \\#define TAG_LET 0x0A
+    \\#define TAG_USE 0x0B
+    \\#define TAG_EQL 0x0C
+    \\#define TAG_C00 0x10
+    \\#define TAG_C15 0x1F
+    \\#define TAG_MAT 0x20
+    \\#define TAG_SWI 0x21
+    \\#define TAG_NUM 0x22
+    \\#define TAG_P00 0x30
+    \\#define TAG_P02 0x32
+    \\#define TAG_P15 0x3F
+    \\
+    \\inline bool is_ctr_tag(uint tag) {
+    \\    return tag >= TAG_C00 && tag <= TAG_C15;
+    \\}
+    \\
+    \\inline bool is_value_tag(uint tag) {
+    \\    return tag == TAG_LAM || tag == TAG_SUP || tag == TAG_ERA || tag == TAG_NUM || is_ctr_tag(tag);
+    \\}
+    \\
+    \\inline bool is_redex_tag(uint tag) {
+    \\    return tag == TAG_REF || tag == TAG_VAR || tag == TAG_APP || tag == TAG_CO0 || tag == TAG_CO1 ||
+    \\        tag == TAG_MAT || tag == TAG_SWI || tag == TAG_LET || tag == TAG_USE || tag == TAG_RED ||
+    \\        tag == TAG_P02 || tag == TAG_EQL;
+    \\}
+    \\
+    \\inline void push_redex(
+    \\    device uint2* out,
+    \\    device atomic_uint* out_count,
+    \\    device atomic_uint* stats,
+    \\    uint loc_a,
+    \\    uint loc_b
+    \\) {
+    \\    uint cap = atomic_load_explicit(&stats[3], memory_order_relaxed);
+    \\    uint idx = atomic_fetch_add_explicit(out_count, 1, memory_order_relaxed);
+    \\    if (idx < cap) {
+    \\        out[idx] = uint2(loc_a, loc_b);
+    \\    }
+    \\}
+    \\
+    \\inline void enqueue_loc(
+    \\    device ulong* heap,
+    \\    device uint2* out,
+    \\    device atomic_uint* out_count,
+    \\    device atomic_uint* stats,
+    \\    uint loc
+    \\) {
+    \\    ulong term = TERM_CLR_SUB(heap[loc]);
+    \\    uint tag = GET_TAG(term);
+    \\    if (!is_redex_tag(tag)) return;
+    \\    uint val = GET_VAL(term);
+    \\    uint loc_b = (tag == TAG_REF) ? 0xFFFFFFFFu : val;
+    \\    push_redex(out, out_count, stats, loc, loc_b);
+    \\}
+    \\
+    \\inline bool try_lock(device atomic_uint* locks, uint loc) {
+    \\    return atomic_exchange_explicit(&locks[loc], 1, memory_order_relaxed) == 0;
+    \\}
+    \\
+    \\inline void unlock(device atomic_uint* locks, uint loc) {
+    \\    atomic_store_explicit(&locks[loc], 0, memory_order_relaxed);
+    \\}
+    \\
+    \\inline bool tag_has_ptr(uint tag) {
+    \\    if (tag == TAG_LAM || tag == TAG_APP || tag == TAG_SUP || tag == TAG_CO0 || tag == TAG_CO1) return true;
+    \\    if (tag == TAG_VAR || tag == TAG_MAT || tag == TAG_SWI || tag == TAG_LET || tag == TAG_USE || tag == TAG_RED) return true;
+    \\    if (tag == TAG_P02 || tag == TAG_EQL) return true;
+    \\    if (tag >= TAG_C00 && tag <= TAG_C15 && tag != TAG_C00) return true;
+    \\    return false;
+    \\}
+    \\
+    \\inline ulong fixup_term(ulong term, uint base_delta) {
+    \\    bool absolute = TERM_IS_SUB(term);
+    \\    term = TERM_CLR_SUB(term);
+    \\    uint tag = GET_TAG(term);
+    \\    uint ext = GET_EXT(term);
+    \\    uint val = GET_VAL(term);
+    \\    if (tag_has_ptr(tag) && !absolute) {
+    \\        val += base_delta;
+    \\    }
+    \\    return MAKE_TERM(tag, ext, val);
+    \\}
     \\
     \\// Simple kernels
     \\kernel void batch_add(
@@ -513,8 +601,8 @@ const shader_source =
     \\        return;
     \\    }
     \\
-    \\    // Numeric operations (OP2-NUM) - tags 0x20-0x2F are P02
-    \\    if (tag_a >= 0x20 && tag_a <= 0x2F && tag_b == TAG_NUM) {
+    \\    // Numeric operations (P02-NUM)
+    \\    if (tag_a == TAG_P02 && tag_b == TAG_NUM) {
     \\        uint opcode = ext_a;
     \\        uint a = val_b;
     \\        uint b = GET_VAL(heap[val_a]);
@@ -548,6 +636,7 @@ const shader_source =
     \\    if (tag_a == TAG_ERA || tag_b == TAG_ERA) {
     \\        heap[loc_a] = MAKE_TERM(TAG_ERA, 0, 0);
     \\        heap[loc_b] = MAKE_TERM(TAG_ERA, 0, 0);
+    \\        enqueue_loc(heap, redex_out, out_count, stats, loc_a);
     \\        atomic_fetch_add_explicit(&stats[0], 1, memory_order_relaxed);
     \\        return;
     \\    }
@@ -562,6 +651,9 @@ const shader_source =
     \\    device atomic_uint* in_count [[buffer(4)]],
     \\    device atomic_uint* out_count [[buffer(5)]],
     \\    device atomic_uint* stats [[buffer(6)]],
+    \\    device const ulong* tmpl_terms [[buffer(7)]],
+    \\    device const uint* tmpl_info [[buffer(8)]],
+    \\    device atomic_uint* locks [[buffer(9)]],
     \\    uint id [[thread_position_in_grid]]
     \\) {
     \\    uint count = atomic_load_explicit(in_count, memory_order_relaxed);
@@ -569,104 +661,436 @@ const shader_source =
     \\
     \\    uint2 redex = redex_in[id];
     \\    uint loc_a = redex.x;
-    \\    uint loc_b = redex.y;
+    \\    if (!try_lock(locks, loc_a)) {
+    \\        push_redex(redex_out, out_count, stats, loc_a, 0xFFFFFFFFu);
+    \\        return;
+    \\    }
     \\
     \\    ulong term_a = heap[loc_a];
-    \\    ulong term_b = heap[loc_b];
-    \\
     \\    uint tag_a = GET_TAG(term_a);
-    \\    uint tag_b = GET_TAG(term_b);
     \\    uint ext_a = GET_EXT(term_a);
-    \\    uint ext_b = GET_EXT(term_b);
     \\    uint val_a = GET_VAL(term_a);
-    \\    uint val_b = GET_VAL(term_b);
     \\
-    \\    // APP-LAM: Beta reduction
-    \\    if (tag_a == TAG_APP && tag_b == TAG_LAM) {
-    \\        ulong body = heap[val_b];
-    \\        ulong arg = heap[val_a + 1];
-    \\        heap[loc_a] = body;
-    \\        heap[loc_b] = MAKE_TERM(TAG_ERA, 0, 0);
-    \\        if (GET_TAG(body) == TAG_VAR && GET_VAL(body) == val_b) {
-    \\            heap[loc_a] = arg;
-    \\        }
-    \\        if (GET_TAG(body) == TAG_APP) {
-    \\            uint out_idx = atomic_fetch_add_explicit(out_count, 1, memory_order_relaxed);
-    \\            redex_out[out_idx] = uint2(loc_a, GET_VAL(body));
-    \\        }
-    \\        atomic_fetch_add_explicit(&stats[0], 1, memory_order_relaxed);
+    \\    if (!is_redex_tag(tag_a)) {
+    \\        unlock(locks, loc_a);
     \\        return;
     \\    }
     \\
-    \\    // CO0/CO1-SUP
-    \\    if ((tag_a == TAG_CO0 || tag_a == TAG_CO1) && tag_b == TAG_SUP) {
-    \\        if (ext_a == ext_b) {
-    \\            uint offset = (tag_a == TAG_CO0) ? 0 : 1;
-    \\            ulong result = heap[val_b + offset];
-    \\            heap[loc_a] = result;
-    \\            heap[loc_b] = MAKE_TERM(TAG_ERA, 0, 0);
-    \\            uint result_tag = GET_TAG(result);
-    \\            if (result_tag == TAG_CO0 || result_tag == TAG_CO1) {
-    \\                uint out_idx = atomic_fetch_add_explicit(out_count, 1, memory_order_relaxed);
-    \\                redex_out[out_idx] = uint2(loc_a, GET_VAL(result));
+    \\    uint loc_b = 0xFFFFFFFFu;
+    \\    bool locked_b = false;
+    \\    if (tag_a != TAG_REF) {
+    \\        loc_b = val_a;
+    \\        if (loc_b != loc_a) {
+    \\            locked_b = try_lock(locks, loc_b);
+    \\            if (!locked_b) {
+    \\                unlock(locks, loc_a);
+    \\                push_redex(redex_out, out_count, stats, loc_a, 0xFFFFFFFFu);
+    \\                return;
     \\            }
+    \\        }
+    \\    }
+    \\
+    \\
+    \\#define REDUCE_STEP_RETURN() { if (locked_b) { unlock(locks, loc_b); } unlock(locks, loc_a); return; }
+    \\    ulong term_b = 0;
+    \\    uint tag_b = 0xFF;
+    \\    uint ext_b = 0;
+    \\    uint val_b = 0;
+    \\    if (loc_b != 0xFFFFFFFFu) {
+    \\        term_b = heap[loc_b];
+    \\        tag_b = GET_TAG(term_b);
+    \\        ext_b = GET_EXT(term_b);
+    \\        val_b = GET_VAL(term_b);
+    \\    }
+    \\
+    \\    // REF expansion (template instantiation)
+    \\    if (tag_a == TAG_REF) {
+    \\        uint info_idx = ext_a * 3;
+    \\        uint tmpl_off = tmpl_info[info_idx];
+    \\        uint tmpl_len = tmpl_info[info_idx + 1];
+    \\        uint tmpl_root = tmpl_info[info_idx + 2];
+    \\        if (tmpl_root == 0xFFFFFFFFu) {
+    \\            REDUCE_STEP_RETURN();
+    \\        }
+    \\        if (tmpl_len == 0) {
+    \\            ulong root_term = tmpl_terms[tmpl_off + tmpl_root];
+    \\            heap[loc_a] = fixup_term(root_term, 0);
+    \\            enqueue_loc(heap, redex_out, out_count, stats, loc_a);
+    \\            atomic_fetch_add_explicit(&stats[0], 1, memory_order_relaxed);
+    \\            REDUCE_STEP_RETURN();
+    \\        }
+    \\        uint base = atomic_fetch_add_explicit(alloc_ptr, tmpl_len, memory_order_relaxed);
+    \\        atomic_fetch_add_explicit(&stats[1], tmpl_len, memory_order_relaxed);
+    \\        uint base_delta = base - tmpl_off;
+    \\        for (uint i = 0; i < tmpl_len; i++) {
+    \\            ulong t = tmpl_terms[tmpl_off + i];
+    \\            heap[base + i] = fixup_term(t, base_delta);
+    \\        }
+    \\        ulong root_term = tmpl_terms[tmpl_off + tmpl_root];
+    \\        heap[loc_a] = fixup_term(root_term, base_delta);
+    \\        enqueue_loc(heap, redex_out, out_count, stats, loc_a);
+    \\        atomic_fetch_add_explicit(&stats[0], 1, memory_order_relaxed);
+    \\        REDUCE_STEP_RETURN();
+    \\    }
+    \\
+    \\    // VAR substitution / path compression
+    \\    if (tag_a == TAG_VAR) {
+    \\        ulong bound = heap[val_a];
+    \\        ulong clean = TERM_CLR_SUB(bound);
+    \\        uint b_tag = GET_TAG(clean);
+    \\        if (b_tag == TAG_VAR) {
+    \\            heap[loc_a] = clean;
+    \\            enqueue_loc(heap, redex_out, out_count, stats, loc_a);
+    \\            atomic_fetch_add_explicit(&stats[0], 1, memory_order_relaxed);
+    \\        } else if (is_value_tag(b_tag)) {
+    \\            heap[val_a] = clean | SUB_BIT;
+    \\            heap[loc_a] = clean;
+    \\            enqueue_loc(heap, redex_out, out_count, stats, loc_a);
+    \\            atomic_fetch_add_explicit(&stats[0], 1, memory_order_relaxed);
     \\        } else {
-    \\            uint new_loc = atomic_fetch_add_explicit(alloc_ptr, 4, memory_order_relaxed);
-    \\            atomic_fetch_add_explicit(&stats[1], 4, memory_order_relaxed);
-    \\            ulong fst = heap[val_b];
-    \\            ulong snd = heap[val_b + 1];
-    \\            heap[new_loc] = MAKE_TERM(tag_a, ext_a, GET_VAL(fst));
-    \\            heap[new_loc + 1] = MAKE_TERM(tag_a, ext_a, GET_VAL(snd));
-    \\            heap[new_loc + 2] = MAKE_TERM(tag_a == TAG_CO0 ? TAG_CO1 : TAG_CO0, ext_a, GET_VAL(fst));
-    \\            heap[new_loc + 3] = MAKE_TERM(tag_a == TAG_CO0 ? TAG_CO1 : TAG_CO0, ext_a, GET_VAL(snd));
-    \\            heap[loc_a] = MAKE_TERM(TAG_SUP, ext_b, new_loc);
-    \\            heap[loc_b] = MAKE_TERM(TAG_ERA, 0, 0);
-    \\            uint out_idx = atomic_fetch_add_explicit(out_count, 2, memory_order_relaxed);
-    \\            redex_out[out_idx] = uint2(new_loc, GET_VAL(fst));
-    \\            redex_out[out_idx + 1] = uint2(new_loc + 2, GET_VAL(snd));
+    \\            enqueue_loc(heap, redex_out, out_count, stats, val_a);
+    \\            push_redex(redex_out, out_count, stats, loc_a, val_a);
     \\        }
-    \\        atomic_fetch_add_explicit(&stats[0], 1, memory_order_relaxed);
-    \\        return;
+    \\        REDUCE_STEP_RETURN();
     \\    }
     \\
-    \\    // Numeric operations
-    \\    if (tag_a >= 0x20 && tag_a <= 0x2F && tag_b == TAG_NUM) {
-    \\        uint opcode = ext_a;
-    \\        uint a = val_b;
-    \\        uint b = GET_VAL(heap[val_a]);
-    \\        uint result;
-    \\        switch (opcode) {
-    \\            case 0: result = a + b; break;
-    \\            case 1: result = a - b; break;
-    \\            case 2: result = a * b; break;
-    \\            case 3: result = b != 0 ? a / b : 0; break;
-    \\            case 4: result = b != 0 ? a % b : 0; break;
-    \\            case 5: result = a & b; break;
-    \\            case 6: result = a | b; break;
-    \\            case 7: result = a ^ b; break;
-    \\            case 8: result = a << (b & 31); break;
-    \\            case 9: result = a >> (b & 31); break;
-    \\            case 10: result = a == b ? 1 : 0; break;
-    \\            case 11: result = a != b ? 1 : 0; break;
-    \\            case 12: result = a < b ? 1 : 0; break;
-    \\            case 13: result = a <= b ? 1 : 0; break;
-    \\            case 14: result = a > b ? 1 : 0; break;
-    \\            case 15: result = a >= b ? 1 : 0; break;
-    \\            default: result = 0; break;
+    \\    // APP interactions
+    \\    if (tag_a == TAG_APP) {
+    \\        if (tag_b == TAG_LAM) {
+    \\            uint lam_loc = val_b;
+    \\            ulong arg = heap[val_a + 1];
+    \\            ulong body = heap[lam_loc];
+    \\            heap[lam_loc] = arg | SUB_BIT;
+    \\            heap[loc_a] = body;
+    \\            enqueue_loc(heap, redex_out, out_count, stats, loc_a);
+    \\            atomic_fetch_add_explicit(&stats[0], 1, memory_order_relaxed);
+    \\            REDUCE_STEP_RETURN();
+    \\        } else if (tag_b == TAG_ERA) {
+    \\            heap[loc_a] = MAKE_TERM(TAG_ERA, 0, 0);
+    \\            enqueue_loc(heap, redex_out, out_count, stats, loc_a);
+    \\            atomic_fetch_add_explicit(&stats[0], 1, memory_order_relaxed);
+    \\            REDUCE_STEP_RETURN();
+    \\        } else if (tag_b == TAG_SUP) {
+    \\            uint sup_loc = val_b;
+    \\            uint sup_lab = ext_b;
+    \\            ulong arg = heap[val_a + 1];
+    \\            ulong lft = heap[sup_loc];
+    \\            ulong rgt = heap[sup_loc + 1];
+    \\            uint base = atomic_fetch_add_explicit(alloc_ptr, 7, memory_order_relaxed);
+    \\            atomic_fetch_add_explicit(&stats[1], 7, memory_order_relaxed);
+    \\            heap[base] = arg;
+    \\            heap[base + 1] = lft;
+    \\            heap[base + 2] = MAKE_TERM(TAG_CO0, sup_lab, base);
+    \\            heap[base + 3] = rgt;
+    \\            heap[base + 4] = MAKE_TERM(TAG_CO1, sup_lab, base);
+    \\            heap[base + 5] = MAKE_TERM(TAG_APP, 0, base + 1);
+    \\            heap[base + 6] = MAKE_TERM(TAG_APP, 0, base + 3);
+    \\            heap[loc_a] = MAKE_TERM(TAG_SUP, sup_lab, base + 5);
+    \\            enqueue_loc(heap, redex_out, out_count, stats, loc_a);
+    \\            atomic_fetch_add_explicit(&stats[0], 1, memory_order_relaxed);
+    \\            REDUCE_STEP_RETURN();
     \\        }
-    \\        heap[loc_a] = MAKE_TERM(TAG_NUM, 0, result);
-    \\        heap[loc_b] = MAKE_TERM(TAG_ERA, 0, 0);
-    \\        atomic_fetch_add_explicit(&stats[0], 1, memory_order_relaxed);
-    \\        return;
+    \\        enqueue_loc(heap, redex_out, out_count, stats, val_a);
+    \\        push_redex(redex_out, out_count, stats, loc_a, loc_b);
+    \\        REDUCE_STEP_RETURN();
     \\    }
     \\
-    \\    // Erasure
+    \\    // CO0/CO1 interactions
+    \\    if (tag_a == TAG_CO0 || tag_a == TAG_CO1) {
+    \\        uint dup_loc = val_a;
+    \\        ulong target = heap[dup_loc];
+    \\        if (TERM_IS_SUB(target)) {
+    \\            heap[loc_a] = TERM_CLR_SUB(target);
+    \\            enqueue_loc(heap, redex_out, out_count, stats, loc_a);
+    \\            REDUCE_STEP_RETURN();
+    \\        }
+    \\        uint t_tag = GET_TAG(target);
+    \\        if (t_tag == TAG_SUP) {
+    \\            uint sup_loc = GET_VAL(target);
+    \\            uint sup_lab = GET_EXT(target);
+    \\            uint dup_lab = ext_a;
+    \\            if (dup_lab == sup_lab) {
+    \\                ulong lft = heap[sup_loc];
+    \\                ulong rgt = heap[sup_loc + 1];
+    \\                if (tag_a == TAG_CO0) {
+    \\                    heap[dup_loc] = TERM_CLR_SUB(rgt) | SUB_BIT;
+    \\                    heap[loc_a] = TERM_CLR_SUB(lft);
+    \\                } else {
+    \\                    heap[dup_loc] = TERM_CLR_SUB(lft) | SUB_BIT;
+    \\                    heap[loc_a] = TERM_CLR_SUB(rgt);
+    \\                }
+    \\            } else {
+    \\                uint base = atomic_fetch_add_explicit(alloc_ptr, 4, memory_order_relaxed);
+    \\                atomic_fetch_add_explicit(&stats[1], 4, memory_order_relaxed);
+    \\                heap[base] = MAKE_TERM(TAG_CO0, dup_lab, sup_loc);
+    \\                heap[base + 1] = MAKE_TERM(TAG_CO0, dup_lab, sup_loc + 1);
+    \\                heap[base + 2] = MAKE_TERM(TAG_CO1, dup_lab, sup_loc);
+    \\                heap[base + 3] = MAKE_TERM(TAG_CO1, dup_lab, sup_loc + 1);
+    \\                if (tag_a == TAG_CO0) {
+    \\                    heap[dup_loc] = MAKE_TERM(TAG_SUP, sup_lab, base + 2) | SUB_BIT;
+    \\                    heap[loc_a] = MAKE_TERM(TAG_SUP, sup_lab, base);
+    \\                } else {
+    \\                    heap[dup_loc] = MAKE_TERM(TAG_SUP, sup_lab, base) | SUB_BIT;
+    \\                    heap[loc_a] = MAKE_TERM(TAG_SUP, sup_lab, base + 2);
+    \\                }
+    \\            }
+    \\            enqueue_loc(heap, redex_out, out_count, stats, loc_a);
+    \\            atomic_fetch_add_explicit(&stats[0], 1, memory_order_relaxed);
+    \\            REDUCE_STEP_RETURN();
+    \\        }
+    \\        if (t_tag == TAG_NUM || t_tag == TAG_ERA) {
+    \\            ulong clean = TERM_CLR_SUB(target);
+    \\            heap[dup_loc] = clean | SUB_BIT;
+    \\            heap[loc_a] = clean;
+    \\            enqueue_loc(heap, redex_out, out_count, stats, loc_a);
+    \\            atomic_fetch_add_explicit(&stats[0], 1, memory_order_relaxed);
+    \\            REDUCE_STEP_RETURN();
+    \\        }
+    \\        if (t_tag == TAG_LAM) {
+    \\            uint dup_lab = ext_a;
+    \\            uint lam_loc = GET_VAL(target);
+    \\            ulong bod = heap[lam_loc];
+    \\            uint base = atomic_fetch_add_explicit(alloc_ptr, 3, memory_order_relaxed);
+    \\            atomic_fetch_add_explicit(&stats[1], 3, memory_order_relaxed);
+    \\            heap[base] = bod;
+    \\            heap[base + 1] = MAKE_TERM(TAG_CO0, dup_lab, base);
+    \\            heap[base + 2] = MAKE_TERM(TAG_CO1, dup_lab, base);
+    \\            if (tag_a == TAG_CO0) {
+    \\                heap[dup_loc] = MAKE_TERM(TAG_LAM, 0, base + 2) | SUB_BIT;
+    \\                heap[loc_a] = MAKE_TERM(TAG_LAM, 0, base + 1);
+    \\            } else {
+    \\                heap[dup_loc] = MAKE_TERM(TAG_LAM, 0, base + 1) | SUB_BIT;
+    \\                heap[loc_a] = MAKE_TERM(TAG_LAM, 0, base + 2);
+    \\            }
+    \\            enqueue_loc(heap, redex_out, out_count, stats, loc_a);
+    \\            atomic_fetch_add_explicit(&stats[0], 1, memory_order_relaxed);
+    \\            REDUCE_STEP_RETURN();
+    \\        }
+    \\        if (t_tag == TAG_APP) {
+    \\            uint dup_lab = ext_a;
+    \\            uint app_loc = GET_VAL(target);
+    \\            uint base = atomic_fetch_add_explicit(alloc_ptr, 6, memory_order_relaxed);
+    \\            atomic_fetch_add_explicit(&stats[1], 6, memory_order_relaxed);
+    \\            heap[base] = heap[app_loc];
+    \\            heap[base + 1] = heap[app_loc + 1];
+    \\            heap[base + 2] = MAKE_TERM(TAG_CO0, dup_lab, base);
+    \\            heap[base + 3] = MAKE_TERM(TAG_CO0, dup_lab, base + 1);
+    \\            heap[base + 4] = MAKE_TERM(TAG_CO1, dup_lab, base);
+    \\            heap[base + 5] = MAKE_TERM(TAG_CO1, dup_lab, base + 1);
+    \\            if (tag_a == TAG_CO0) {
+    \\                heap[dup_loc] = MAKE_TERM(TAG_APP, 0, base + 4) | SUB_BIT;
+    \\                heap[loc_a] = MAKE_TERM(TAG_APP, 0, base + 2);
+    \\            } else {
+    \\                heap[dup_loc] = MAKE_TERM(TAG_APP, 0, base + 2) | SUB_BIT;
+    \\                heap[loc_a] = MAKE_TERM(TAG_APP, 0, base + 4);
+    \\            }
+    \\            enqueue_loc(heap, redex_out, out_count, stats, loc_a);
+    \\            atomic_fetch_add_explicit(&stats[0], 1, memory_order_relaxed);
+    \\            REDUCE_STEP_RETURN();
+    \\        }
+    \\        if (is_ctr_tag(t_tag)) {
+    \\            uint arity = t_tag - TAG_C00;
+    \\            if (arity == 0) {
+    \\                ulong clean = TERM_CLR_SUB(target);
+    \\                heap[dup_loc] = clean | SUB_BIT;
+    \\                heap[loc_a] = clean;
+    \\            } else {
+    \\                uint dup_lab = ext_a;
+    \\                uint ctr_loc = GET_VAL(target);
+    \\                uint base = atomic_fetch_add_explicit(alloc_ptr, 3 * arity, memory_order_relaxed);
+    \\                atomic_fetch_add_explicit(&stats[1], 3 * arity, memory_order_relaxed);
+    \\                for (uint i = 0; i < arity; i++) {
+    \\                    heap[base + i] = heap[ctr_loc + i];
+    \\                }
+    \\                uint ctr0 = base + arity;
+    \\                uint ctr1 = base + arity + arity;
+    \\                for (uint i = 0; i < arity; i++) {
+    \\                    heap[ctr0 + i] = MAKE_TERM(TAG_CO0, dup_lab, base + i);
+    \\                    heap[ctr1 + i] = MAKE_TERM(TAG_CO1, dup_lab, base + i);
+    \\                }
+    \\                if (tag_a == TAG_CO0) {
+    \\                    heap[dup_loc] = MAKE_TERM(t_tag, ext_b, ctr1) | SUB_BIT;
+    \\                    heap[loc_a] = MAKE_TERM(t_tag, ext_b, ctr0);
+    \\                } else {
+    \\                    heap[dup_loc] = MAKE_TERM(t_tag, ext_b, ctr0) | SUB_BIT;
+    \\                    heap[loc_a] = MAKE_TERM(t_tag, ext_b, ctr1);
+    \\                }
+    \\            }
+    \\            enqueue_loc(heap, redex_out, out_count, stats, loc_a);
+    \\            atomic_fetch_add_explicit(&stats[0], 1, memory_order_relaxed);
+    \\            REDUCE_STEP_RETURN();
+    \\        }
+    \\        enqueue_loc(heap, redex_out, out_count, stats, dup_loc);
+    \\        push_redex(redex_out, out_count, stats, loc_a, loc_b);
+    \\        REDUCE_STEP_RETURN();
+    \\    }
+    \\
+    \\    // MAT + CTR
+    \\    if (tag_a == TAG_MAT) {
+    \\        if (is_ctr_tag(tag_b)) {
+    \\            uint ctr_loc = val_b;
+    \\            uint case_idx = ext_b;
+    \\            uint arity = tag_b - TAG_C00;
+    \\            ulong branch = heap[val_a + 1 + case_idx];
+    \\            for (uint i = 0; i < arity; i++) {
+    \\                uint app_loc = atomic_fetch_add_explicit(alloc_ptr, 2, memory_order_relaxed);
+    \\                atomic_fetch_add_explicit(&stats[1], 2, memory_order_relaxed);
+    \\                heap[app_loc] = branch;
+    \\                heap[app_loc + 1] = heap[ctr_loc + i];
+    \\                branch = MAKE_TERM(TAG_APP, 0, app_loc);
+    \\            }
+    \\            heap[loc_a] = branch;
+    \\            enqueue_loc(heap, redex_out, out_count, stats, loc_a);
+    \\            atomic_fetch_add_explicit(&stats[0], 1, memory_order_relaxed);
+    \\            REDUCE_STEP_RETURN();
+    \\        }
+    \\        enqueue_loc(heap, redex_out, out_count, stats, val_a);
+    \\        push_redex(redex_out, out_count, stats, loc_a, loc_b);
+    \\        REDUCE_STEP_RETURN();
+    \\    }
+    \\
+    \\    // SWI + NUM
+    \\    if (tag_a == TAG_SWI) {
+    \\        if (tag_b == TAG_NUM) {
+    \\            uint num_val = val_b;
+    \\            if (num_val == 0) {
+    \\                heap[loc_a] = heap[val_a + 1];
+    \\            } else {
+    \\                uint app_loc = atomic_fetch_add_explicit(alloc_ptr, 2, memory_order_relaxed);
+    \\                atomic_fetch_add_explicit(&stats[1], 2, memory_order_relaxed);
+    \\                heap[app_loc] = heap[val_a + 2];
+    \\                heap[app_loc + 1] = MAKE_TERM(TAG_NUM, 0, num_val - 1);
+    \\                heap[loc_a] = MAKE_TERM(TAG_APP, 0, app_loc);
+    \\            }
+    \\            enqueue_loc(heap, redex_out, out_count, stats, loc_a);
+    \\            atomic_fetch_add_explicit(&stats[0], 1, memory_order_relaxed);
+    \\            REDUCE_STEP_RETURN();
+    \\        }
+    \\        enqueue_loc(heap, redex_out, out_count, stats, val_a);
+    \\        push_redex(redex_out, out_count, stats, loc_a, loc_b);
+    \\        REDUCE_STEP_RETURN();
+    \\    }
+    \\
+    \\    // LET/USE/RED
+    \\    if (tag_a == TAG_LET) {
+    \\        ulong bound = heap[val_a];
+    \\        if (is_value_tag(GET_TAG(bound))) {
+    \\            ulong clean = TERM_CLR_SUB(bound);
+    \\            heap[val_a] = clean | SUB_BIT;
+    \\            heap[loc_a] = heap[val_a + 1];
+    \\            enqueue_loc(heap, redex_out, out_count, stats, loc_a);
+    \\            atomic_fetch_add_explicit(&stats[0], 1, memory_order_relaxed);
+    \\        } else {
+    \\            enqueue_loc(heap, redex_out, out_count, stats, val_a);
+    \\            push_redex(redex_out, out_count, stats, loc_a, loc_b);
+    \\        }
+    \\        REDUCE_STEP_RETURN();
+    \\    }
+    \\    if (tag_a == TAG_USE) {
+    \\        ulong bound = heap[val_a];
+    \\        if (is_value_tag(GET_TAG(bound))) {
+    \\            ulong clean = TERM_CLR_SUB(bound);
+    \\            heap[val_a] = clean;
+    \\            heap[loc_a] = clean;
+    \\            enqueue_loc(heap, redex_out, out_count, stats, loc_a);
+    \\            atomic_fetch_add_explicit(&stats[0], 1, memory_order_relaxed);
+    \\        } else {
+    \\            enqueue_loc(heap, redex_out, out_count, stats, val_a);
+    \\            push_redex(redex_out, out_count, stats, loc_a, loc_b);
+    \\        }
+    \\        REDUCE_STEP_RETURN();
+    \\    }
+    \\    if (tag_a == TAG_RED) {
+    \\        ulong bound = heap[val_a];
+    \\        if (is_value_tag(GET_TAG(bound))) {
+    \\            heap[loc_a] = TERM_CLR_SUB(bound);
+    \\            enqueue_loc(heap, redex_out, out_count, stats, loc_a);
+    \\            atomic_fetch_add_explicit(&stats[0], 1, memory_order_relaxed);
+    \\        } else {
+    \\            enqueue_loc(heap, redex_out, out_count, stats, val_a);
+    \\            push_redex(redex_out, out_count, stats, loc_a, loc_b);
+    \\        }
+    \\        REDUCE_STEP_RETURN();
+    \\    }
+    \\
+    \\    // P02 numeric ops
+    \\    if (tag_a == TAG_P02) {
+    \\        ulong left = heap[val_a];
+    \\        ulong right = heap[val_a + 1];
+    \\        if (GET_TAG(left) == TAG_NUM && GET_TAG(right) == TAG_NUM) {
+    \\            uint opcode = ext_a;
+    \\            uint a = GET_VAL(left);
+    \\            uint b = GET_VAL(right);
+    \\            uint result;
+    \\            switch (opcode) {
+    \\                case 0: result = a + b; break;
+    \\                case 1: result = a - b; break;
+    \\                case 2: result = a * b; break;
+    \\                case 3: result = b != 0 ? a / b : 0; break;
+    \\                case 4: result = b != 0 ? a % b : 0; break;
+    \\                case 5: result = a & b; break;
+    \\                case 6: result = a | b; break;
+    \\                case 7: result = a ^ b; break;
+    \\                case 8: result = a << (b & 31); break;
+    \\                case 9: result = a >> (b & 31); break;
+    \\                case 10: result = a == b ? 1 : 0; break;
+    \\                case 11: result = a != b ? 1 : 0; break;
+    \\                case 12: result = a < b ? 1 : 0; break;
+    \\                case 13: result = a <= b ? 1 : 0; break;
+    \\                case 14: result = a > b ? 1 : 0; break;
+    \\                case 15: result = a >= b ? 1 : 0; break;
+    \\                default: result = 0; break;
+    \\            }
+    \\            heap[loc_a] = MAKE_TERM(TAG_NUM, 0, result);
+    \\            enqueue_loc(heap, redex_out, out_count, stats, loc_a);
+    \\            atomic_fetch_add_explicit(&stats[0], 1, memory_order_relaxed);
+    \\        } else {
+    \\            enqueue_loc(heap, redex_out, out_count, stats, val_a);
+    \\            enqueue_loc(heap, redex_out, out_count, stats, val_a + 1);
+    \\            push_redex(redex_out, out_count, stats, loc_a, loc_b);
+    \\        }
+    \\        REDUCE_STEP_RETURN();
+    \\    }
+    \\
+    \\    // EQL (basic)
+    \\    if (tag_a == TAG_EQL) {
+    \\        ulong left = heap[val_a];
+    \\        ulong right = heap[val_a + 1];
+    \\        uint lt = GET_TAG(left);
+    \\        uint rt = GET_TAG(right);
+    \\        if (!is_value_tag(lt) || !is_value_tag(rt)) {
+    \\            enqueue_loc(heap, redex_out, out_count, stats, val_a);
+    \\            enqueue_loc(heap, redex_out, out_count, stats, val_a + 1);
+    \\            push_redex(redex_out, out_count, stats, loc_a, loc_b);
+    \\            REDUCE_STEP_RETURN();
+    \\        }
+    \\        uint eq = 0;
+    \\        if (lt == rt) {
+    \\            if (lt == TAG_NUM) {
+    \\                eq = (GET_VAL(left) == GET_VAL(right)) ? 1 : 0;
+    \\            } else if (lt == TAG_ERA) {
+    \\                eq = 1;
+    \\            } else if (is_ctr_tag(lt) && lt == TAG_C00 && rt == TAG_C00) {
+    \\                eq = 1;
+    \\            }
+    \\        }
+    \\        heap[loc_a] = MAKE_TERM(TAG_NUM, 0, eq);
+    \\        enqueue_loc(heap, redex_out, out_count, stats, loc_a);
+    \\        atomic_fetch_add_explicit(&stats[0], 1, memory_order_relaxed);
+    \\        REDUCE_STEP_RETURN();
+    \\    }
+    \\
+    \\    // Erasure fallback
     \\    if (tag_a == TAG_ERA || tag_b == TAG_ERA) {
     \\        heap[loc_a] = MAKE_TERM(TAG_ERA, 0, 0);
-    \\        heap[loc_b] = MAKE_TERM(TAG_ERA, 0, 0);
+    \\        if (loc_b != 0) {
+    \\            heap[loc_b] = MAKE_TERM(TAG_ERA, 0, 0);
+    \\        }
     \\        atomic_fetch_add_explicit(&stats[0], 1, memory_order_relaxed);
     \\    }
+    \\    REDUCE_STEP_RETURN();
     \\}
+    \\#undef REDUCE_STEP_RETURN
     \\
     \\// Scan heap for active redexes
     \\kernel void scan_redexes(
@@ -674,6 +1098,7 @@ const shader_source =
     \\    device uint2* redexes [[buffer(1)]],
     \\    device atomic_uint* redex_count [[buffer(2)]],
     \\    constant uint& heap_size [[buffer(3)]],
+    \\    constant uint& redex_cap [[buffer(4)]],
     \\    uint id [[thread_position_in_grid]]
     \\) {
     \\    if (id >= heap_size) return;
@@ -681,16 +1106,48 @@ const shader_source =
     \\    uint tag = GET_TAG(term);
     \\    uint val = GET_VAL(term);
     \\    bool is_active = false;
-    \\    if (tag == TAG_APP) {
+    \\    uint loc_b = val;
+    \\
+    \\    if (tag == TAG_REF) {
+    \\        is_active = true;
+    \\        loc_b = 0xFFFFFFFFu;
+    \\    } else if (tag == TAG_VAR) {
+    \\        ulong bound = heap[val];
+    \\        ulong clean = TERM_CLR_SUB(bound);
+    \\        uint b_tag = GET_TAG(clean);
+    \\        if (b_tag == TAG_VAR || is_value_tag(b_tag)) is_active = true;
+    \\    } else if (tag == TAG_APP) {
     \\        ulong func = heap[val];
-    \\        if (GET_TAG(func) == TAG_LAM) is_active = true;
+    \\        uint f_tag = GET_TAG(func);
+    \\        if (f_tag == TAG_LAM || f_tag == TAG_SUP || f_tag == TAG_ERA) is_active = true;
     \\    } else if (tag == TAG_CO0 || tag == TAG_CO1) {
     \\        ulong target = heap[val];
-    \\        if (GET_TAG(target) == TAG_SUP) is_active = true;
+    \\        uint t_tag = GET_TAG(target);
+    \\        if (t_tag == TAG_SUP || t_tag == TAG_NUM || t_tag == TAG_ERA || t_tag == TAG_LAM || t_tag == TAG_APP || is_ctr_tag(t_tag)) is_active = true;
+    \\    } else if (tag == TAG_MAT) {
+    \\        ulong scrut = heap[val];
+    \\        if (is_ctr_tag(GET_TAG(scrut))) is_active = true;
+    \\    } else if (tag == TAG_SWI) {
+    \\        ulong scrut = heap[val];
+    \\        if (GET_TAG(scrut) == TAG_NUM) is_active = true;
+    \\    } else if (tag == TAG_LET || tag == TAG_USE || tag == TAG_RED) {
+    \\        ulong bound = heap[val];
+    \\        if (is_value_tag(GET_TAG(bound))) is_active = true;
+    \\    } else if (tag == TAG_P02) {
+    \\        ulong left = heap[val];
+    \\        ulong right = heap[val + 1];
+    \\        if (GET_TAG(left) == TAG_NUM && GET_TAG(right) == TAG_NUM) is_active = true;
+    \\    } else if (tag == TAG_EQL) {
+    \\        ulong left = heap[val];
+    \\        ulong right = heap[val + 1];
+    \\        if (is_value_tag(GET_TAG(left)) && is_value_tag(GET_TAG(right))) is_active = true;
     \\    }
+    \\
     \\    if (is_active) {
     \\        uint idx = atomic_fetch_add_explicit(redex_count, 1, memory_order_relaxed);
-    \\        redexes[idx] = uint2(id, val);
+    \\        if (idx < redex_cap) {
+    \\            redexes[idx] = uint2(id, loc_b);
+    \\        }
     \\    }
     \\}
     \\
@@ -776,12 +1233,14 @@ pub const MetalGPU = struct {
     gpu_heap: id = null,              // Permanent GPU heap
     gpu_heap_ptr: ?[*]u64 = null,     // CPU pointer to GPU heap
     gpu_heap_capacity: usize = 0,     // Max terms in GPU heap
+    heap_locks: id = null,            // Per-node locks for GPU reduction
+    heap_locks_ptr: ?[*]u32 = null,
 
     // Redex queues (double-buffered for ping-pong)
     redex_queue_a: id = null,         // Redex queue A
     redex_queue_b: id = null,         // Redex queue B
-    redex_ptr_a: ?[*]u64 = null,
-    redex_ptr_b: ?[*]u64 = null,
+    redex_ptr_a: ?[*][2]u32 = null,
+    redex_ptr_b: ?[*][2]u32 = null,
     redex_capacity: usize = 0,        // Max redexes per queue
 
     // Control buffers
@@ -789,6 +1248,19 @@ pub const MetalGPU = struct {
     redex_count_buf: id = null,       // Atomic redex count
     stats_buf: id = null,             // Statistics buffer
     ctrl_ptr: ?[*]u32 = null,         // CPU pointer to control data
+    alloc_ptr_ptr: ?*u32 = null,
+    redex_count_ptr: ?*u32 = null,
+    stats_ptr: ?[*]u32 = null,
+
+    // Template buffers for REF expansion
+    tmpl_terms_buf: id = null,
+    tmpl_info_buf: id = null,
+    tmpl_terms_len: usize = 0,
+    tmpl_info_len: usize = 0,
+
+    // Scan constants (heap size, redex cap)
+    scan_const_buf: id = null,
+    scan_const_ptr: ?[*]u32 = null,
 
     // Async pipelining (triple buffering)
     async_cmd_bufs: [3]id = .{ null, null, null },
@@ -900,8 +1372,21 @@ pub const MetalGPU = struct {
         if (source_str == null) return MetalError.ShaderCompileFailed;
 
         // Compile library
-        self.library = msg3(self.device, sels.newLibraryWithSource_options_error, source_str, @as(id, null), @as(id, null));
-        if (self.library == null) return MetalError.ShaderCompileFailed;
+        var err: id = null;
+        self.library = msg3(self.device, sels.newLibraryWithSource_options_error, source_str, @as(id, null), &err);
+        if (self.library == null) {
+            if (err != null) {
+                const desc_obj = msg0(err, sels.localizedDescription);
+                if (desc_obj != null) {
+                    const cstr_ptr = msg0(desc_obj, sels.UTF8String);
+                    if (cstr_ptr != null) {
+                        const cstr: [*:0]const u8 = @ptrCast(cstr_ptr);
+                        std.debug.print("Metal shader compile error: {s}\n", .{cstr});
+                    }
+                }
+            }
+            return MetalError.ShaderCompileFailed;
+        }
 
         // Create pipeline for batch_add
         const add_name = msg1(NSString, sels.stringWithUTF8String, @as([*:0]const u8, "batch_add"));
@@ -987,11 +1472,15 @@ pub const MetalGPU = struct {
 
         // Release GPU-resident state
         if (self.gpu_heap != null) msgV0(self.gpu_heap, sels.release);
+        if (self.heap_locks != null) msgV0(self.heap_locks, sels.release);
         if (self.redex_queue_a != null) msgV0(self.redex_queue_a, sels.release);
         if (self.redex_queue_b != null) msgV0(self.redex_queue_b, sels.release);
         if (self.alloc_ptr_buf != null) msgV0(self.alloc_ptr_buf, sels.release);
         if (self.redex_count_buf != null) msgV0(self.redex_count_buf, sels.release);
         if (self.stats_buf != null) msgV0(self.stats_buf, sels.release);
+        if (self.tmpl_terms_buf != null) msgV0(self.tmpl_terms_buf, sels.release);
+        if (self.tmpl_info_buf != null) msgV0(self.tmpl_info_buf, sels.release);
+        if (self.scan_const_buf != null) msgV0(self.scan_const_buf, sels.release);
 
         if (self.heap_buffer != null) msgV0(self.heap_buffer, sels.release);
         if (self.add_pipeline != null) msgV0(self.add_pipeline, sels.release);
@@ -1423,6 +1912,16 @@ pub const MetalGPU = struct {
         self.gpu_heap_ptr = @ptrCast(@alignCast(msg0(self.gpu_heap, sels.contents)));
         self.gpu_heap_capacity = heap_capacity;
 
+        const lock_bytes = heap_capacity * @sizeOf(u32);
+        self.heap_locks = msg2(self.device, sels.newBufferWithLength_options, lock_bytes, @as(u64, 0));
+        if (self.heap_locks == null) return MetalError.BufferAllocFailed;
+        self.heap_locks_ptr = @ptrCast(@alignCast(msg0(self.heap_locks, sels.contents)));
+        if (self.heap_locks_ptr) |ptr| {
+            @memset(ptr[0..heap_capacity], 0);
+        } else {
+            return MetalError.BufferAllocFailed;
+        }
+
         // Allocate double-buffered redex queues
         self.redex_queue_a = msg2(self.device, sels.newBufferWithLength_options, redex_bytes, @as(u64, 0));
         self.redex_queue_b = msg2(self.device, sels.newBufferWithLength_options, redex_bytes, @as(u64, 0));
@@ -1439,6 +1938,47 @@ pub const MetalGPU = struct {
             return MetalError.BufferAllocFailed;
         }
         self.ctrl_ptr = @ptrCast(@alignCast(msg0(self.stats_buf, sels.contents)));
+        self.alloc_ptr_ptr = @ptrCast(@alignCast(msg0(self.alloc_ptr_buf, sels.contents)));
+        self.redex_count_ptr = @ptrCast(@alignCast(msg0(self.redex_count_buf, sels.contents)));
+        self.stats_ptr = self.ctrl_ptr;
+
+        self.scan_const_buf = msg2(self.device, sels.newBufferWithLength_options, @as(usize, 8), @as(u64, 0));
+        if (self.scan_const_buf == null) return MetalError.BufferAllocFailed;
+        self.scan_const_ptr = @ptrCast(@alignCast(msg0(self.scan_const_buf, sels.contents)));
+    }
+
+    pub fn uploadTemplates(self: *Self, terms: []const u64, info: []const u32) MetalError!void {
+        const terms_len = if (terms.len == 0) 1 else terms.len;
+        const info_len = if (info.len == 0) 1 else info.len;
+        const terms_bytes = terms_len * @sizeOf(u64);
+        const info_bytes = info_len * @sizeOf(u32);
+
+        if (self.tmpl_terms_buf != null) msgV0(self.tmpl_terms_buf, sels.release);
+        if (self.tmpl_info_buf != null) msgV0(self.tmpl_info_buf, sels.release);
+
+        self.tmpl_terms_buf = msg2(self.device, sels.newBufferWithLength_options, terms_bytes, @as(u64, 0));
+        self.tmpl_info_buf = msg2(self.device, sels.newBufferWithLength_options, info_bytes, @as(u64, 0));
+        if (self.tmpl_terms_buf == null or self.tmpl_info_buf == null) return MetalError.BufferAllocFailed;
+
+        const terms_ptr = msg0(self.tmpl_terms_buf, sels.contents);
+        const info_ptr = msg0(self.tmpl_info_buf, sels.contents);
+        if (terms_ptr == null or info_ptr == null) return MetalError.BufferAllocFailed;
+
+        const terms_dst: [*]u64 = @ptrCast(@alignCast(terms_ptr));
+        const info_dst: [*]u32 = @ptrCast(@alignCast(info_ptr));
+        if (terms.len > 0) {
+            @memcpy(terms_dst[0..terms.len], terms);
+        } else {
+            terms_dst[0] = 0;
+        }
+        if (info.len > 0) {
+            @memcpy(info_dst[0..info.len], info);
+        } else {
+            info_dst[0] = 0;
+        }
+
+        self.tmpl_terms_len = terms.len;
+        self.tmpl_info_len = info.len;
     }
 
     /// Dispatch multi-buffer compute kernel (6 buffers for GPU-resident reduction)
@@ -1491,6 +2031,106 @@ pub const MetalGPU = struct {
         msgV0(cmd_buf, sels.waitUntilCompleted);
     }
 
+    pub fn scanRedexes(self: *Self, heap_len: u32) MetalError!u32 {
+        if (self.scan_redexes_pipeline == null) return MetalError.PipelineCreateFailed;
+        if (self.gpu_heap == null) return MetalError.BufferAllocFailed;
+        if (self.redex_queue_a == null or self.redex_count_buf == null) return MetalError.BufferAllocFailed;
+        if (self.scan_const_buf == null or self.scan_const_ptr == null) return MetalError.BufferAllocFailed;
+
+        if (heap_len == 0) return 0;
+
+        if (self.redex_count_ptr) |ptr| {
+            ptr.* = 0;
+        } else {
+            return MetalError.BufferAllocFailed;
+        }
+
+        const scan_ptr = self.scan_const_ptr.?;
+        scan_ptr[0] = heap_len;
+        scan_ptr[1] = @intCast(self.redex_capacity);
+
+        const cmd_buf = msg0(self.queue, sels.commandBuffer);
+        if (cmd_buf == null) return MetalError.CommandFailed;
+
+        const encoder = msg0(cmd_buf, sels.computeCommandEncoder);
+        if (encoder == null) return MetalError.CommandFailed;
+
+        const setPipeline: *const fn (id, SEL, id) callconv(.c) void = @ptrCast(&objc_msgSend);
+        setPipeline(encoder, sels.setComputePipelineState, self.scan_redexes_pipeline);
+
+        msgV3(encoder, sels.setBuffer_offset_atIndex, self.gpu_heap, @as(NSUInteger, 0), @as(NSUInteger, 0));
+        msgV3(encoder, sels.setBuffer_offset_atIndex, self.redex_queue_a, @as(NSUInteger, 0), @as(NSUInteger, 1));
+        msgV3(encoder, sels.setBuffer_offset_atIndex, self.redex_count_buf, @as(NSUInteger, 0), @as(NSUInteger, 2));
+        msgV3(encoder, sels.setBuffer_offset_atIndex, self.scan_const_buf, @as(NSUInteger, 0), @as(NSUInteger, 3));
+        msgV3(encoder, sels.setBuffer_offset_atIndex, self.scan_const_buf, @as(NSUInteger, 4), @as(NSUInteger, 4));
+
+        const count: usize = heap_len;
+        const threads_per_group = @min(self.max_threads, count);
+        const num_groups = (count + threads_per_group - 1) / threads_per_group;
+
+        msgDispatch(encoder, sels.dispatchThreadgroups_threadsPerThreadgroup, .{ .width = num_groups, .height = 1, .depth = 1 }, .{ .width = threads_per_group, .height = 1, .depth = 1 });
+
+        msgV0(encoder, sels.endEncoding);
+        msgV0(cmd_buf, sels.commit);
+        msgV0(cmd_buf, sels.waitUntilCompleted);
+
+        return self.redex_count_ptr.?.*;
+    }
+
+    pub fn gpuReduceStep(self: *Self, in_count: u32) MetalError!GpuReductionStats {
+        if (self.reduce_step_pipeline == null) return MetalError.PipelineCreateFailed;
+        if (self.gpu_heap == null) return MetalError.BufferAllocFailed;
+        if (self.heap_locks == null) return MetalError.BufferAllocFailed;
+        if (self.tmpl_terms_buf == null or self.tmpl_info_buf == null) return MetalError.BufferAllocFailed;
+        if (self.redex_queue_a == null or self.redex_queue_b == null) return MetalError.BufferAllocFailed;
+        if (in_count == 0) return .{ .interactions = 0, .allocations = 0, .new_redexes = 0 };
+
+        if (self.redex_count_ptr == null or self.stats_ptr == null) return MetalError.BufferAllocFailed;
+
+        self.redex_count_ptr.?.* = in_count;
+        const stats_ptr = self.stats_ptr.?;
+        stats_ptr[0] = 0;
+        stats_ptr[1] = 0;
+        stats_ptr[2] = 0;
+        stats_ptr[3] = @intCast(self.redex_capacity);
+
+        const cmd_buf = msg0(self.queue, sels.commandBuffer);
+        if (cmd_buf == null) return MetalError.CommandFailed;
+
+        const encoder = msg0(cmd_buf, sels.computeCommandEncoder);
+        if (encoder == null) return MetalError.CommandFailed;
+
+        const setPipeline: *const fn (id, SEL, id) callconv(.c) void = @ptrCast(&objc_msgSend);
+        setPipeline(encoder, sels.setComputePipelineState, self.reduce_step_pipeline);
+
+        msgV3(encoder, sels.setBuffer_offset_atIndex, self.gpu_heap, @as(NSUInteger, 0), @as(NSUInteger, 0));
+        msgV3(encoder, sels.setBuffer_offset_atIndex, self.redex_queue_a, @as(NSUInteger, 0), @as(NSUInteger, 1));
+        msgV3(encoder, sels.setBuffer_offset_atIndex, self.redex_queue_b, @as(NSUInteger, 0), @as(NSUInteger, 2));
+        msgV3(encoder, sels.setBuffer_offset_atIndex, self.alloc_ptr_buf, @as(NSUInteger, 0), @as(NSUInteger, 3));
+        msgV3(encoder, sels.setBuffer_offset_atIndex, self.redex_count_buf, @as(NSUInteger, 0), @as(NSUInteger, 4));
+        msgV3(encoder, sels.setBuffer_offset_atIndex, self.stats_buf, @as(NSUInteger, 8), @as(NSUInteger, 5));
+        msgV3(encoder, sels.setBuffer_offset_atIndex, self.stats_buf, @as(NSUInteger, 0), @as(NSUInteger, 6));
+        msgV3(encoder, sels.setBuffer_offset_atIndex, self.tmpl_terms_buf, @as(NSUInteger, 0), @as(NSUInteger, 7));
+        msgV3(encoder, sels.setBuffer_offset_atIndex, self.tmpl_info_buf, @as(NSUInteger, 0), @as(NSUInteger, 8));
+        msgV3(encoder, sels.setBuffer_offset_atIndex, self.heap_locks, @as(NSUInteger, 0), @as(NSUInteger, 9));
+
+        const count: usize = in_count;
+        const threads_per_group = @min(self.max_threads, count);
+        const num_groups = (count + threads_per_group - 1) / threads_per_group;
+
+        msgDispatch(encoder, sels.dispatchThreadgroups_threadsPerThreadgroup, .{ .width = num_groups, .height = 1, .depth = 1 }, .{ .width = threads_per_group, .height = 1, .depth = 1 });
+
+        msgV0(encoder, sels.endEncoding);
+        msgV0(cmd_buf, sels.commit);
+        msgV0(cmd_buf, sels.waitUntilCompleted);
+
+        return .{
+            .interactions = stats_ptr[0],
+            .allocations = stats_ptr[1],
+            .new_redexes = stats_ptr[2],
+        };
+    }
+
     /// GPU-resident heterogeneous batch interaction
     /// Processes mixed redex types (APP-LAM, CO0-SUP, OP2-NUM, etc.) in single dispatch
     /// Returns: number of interactions performed
@@ -1506,7 +2146,7 @@ pub const MetalGPU = struct {
         if (count == 0) return .{ .interactions = 0, .allocations = 0, .new_redexes = 0 };
 
         // Copy redexes to queue A
-        const redex_ptr: [*][2]u32 = @ptrCast(self.redex_ptr_a);
+        const redex_ptr = self.redex_ptr_a orelse return MetalError.BufferAllocFailed;
         @memcpy(redex_ptr[0..count], redexes);
 
         // Initialize control values
@@ -1549,6 +2189,8 @@ pub const MetalGPU = struct {
     ) MetalError!GpuReductionStats {
         if (self.reduce_step_pipeline == null) return MetalError.PipelineCreateFailed;
         if (self.gpu_heap == null) return MetalError.BufferAllocFailed;
+        if (self.heap_locks == null) return MetalError.BufferAllocFailed;
+        if (self.tmpl_terms_buf == null or self.tmpl_info_buf == null) return MetalError.BufferAllocFailed;
 
         var total_stats = GpuReductionStats{
             .interactions = 0,
@@ -1560,7 +2202,7 @@ pub const MetalGPU = struct {
         var current_count = initial_redexes.len;
         if (current_count == 0) return total_stats;
 
-        const redex_ptr_a: [*][2]u32 = @ptrCast(self.redex_ptr_a);
+        const redex_ptr_a = self.redex_ptr_a orelse return MetalError.BufferAllocFailed;
         @memcpy(redex_ptr_a[0..current_count], initial_redexes);
 
         // Initialize allocation pointer
@@ -1582,6 +2224,7 @@ pub const MetalGPU = struct {
             stats_ptr[0] = 0; // interactions
             stats_ptr[1] = 0; // allocations
             stats_ptr[2] = 0; // out_count
+            stats_ptr[3] = @intCast(self.redex_capacity);
 
             // Create out_count buffer pointing to stats[2]
             // Dispatch reduce_step kernel
@@ -1602,6 +2245,9 @@ pub const MetalGPU = struct {
             // Use stats_buf offset 8 for out_count (stats[2])
             msgV3(encoder, sels.setBuffer_offset_atIndex, self.stats_buf, @as(NSUInteger, 8), @as(NSUInteger, 5));
             msgV3(encoder, sels.setBuffer_offset_atIndex, self.stats_buf, @as(NSUInteger, 0), @as(NSUInteger, 6));
+            msgV3(encoder, sels.setBuffer_offset_atIndex, self.tmpl_terms_buf, @as(NSUInteger, 0), @as(NSUInteger, 7));
+            msgV3(encoder, sels.setBuffer_offset_atIndex, self.tmpl_info_buf, @as(NSUInteger, 0), @as(NSUInteger, 8));
+            msgV3(encoder, sels.setBuffer_offset_atIndex, self.heap_locks, @as(NSUInteger, 0), @as(NSUInteger, 9));
 
             const threads_per_group = @min(self.max_threads, current_count);
             const num_groups = (current_count + threads_per_group - 1) / threads_per_group;
@@ -1624,6 +2270,88 @@ pub const MetalGPU = struct {
         }
 
         total_stats.new_redexes = @intCast(current_count);
+        return total_stats;
+    }
+
+    /// GPU-resident reduction loop starting from an existing queue (redex_queue_a)
+    pub fn gpuReduceResidentQueued(
+        self: *Self,
+        initial_count: u32,
+        initial_alloc: u32,
+        max_steps: u32,
+    ) MetalError!GpuReductionStats {
+        if (self.reduce_step_pipeline == null) return MetalError.PipelineCreateFailed;
+        if (self.gpu_heap == null) return MetalError.BufferAllocFailed;
+        if (self.heap_locks == null) return MetalError.BufferAllocFailed;
+        if (self.tmpl_terms_buf == null or self.tmpl_info_buf == null) return MetalError.BufferAllocFailed;
+
+        var total_stats = GpuReductionStats{
+            .interactions = 0,
+            .allocations = 0,
+            .new_redexes = 0,
+        };
+
+        var current_count: u32 = initial_count;
+        if (current_count == 0) return total_stats;
+
+        // Initialize allocation pointer
+        const alloc_ptr: *u32 = @ptrCast(@alignCast(msg0(self.alloc_ptr_buf, sels.contents)));
+        alloc_ptr.* = initial_alloc;
+
+        // Get control pointers
+        const in_count_ptr: *u32 = @ptrCast(@alignCast(msg0(self.redex_count_buf, sels.contents)));
+        const stats_ptr: [*]u32 = @ptrCast(@alignCast(msg0(self.stats_buf, sels.contents)));
+
+        var current_in_queue = self.redex_queue_a;
+        var current_out_queue = self.redex_queue_b;
+
+        var step: u32 = 0;
+        while (step < max_steps and current_count > 0) : (step += 1) {
+            in_count_ptr.* = current_count;
+            stats_ptr[0] = 0; // interactions
+            stats_ptr[1] = 0; // allocations
+            stats_ptr[2] = 0; // out_count
+            stats_ptr[3] = @intCast(self.redex_capacity);
+
+            const cmd_buf = msg0(self.queue, sels.commandBuffer);
+            if (cmd_buf == null) return MetalError.CommandFailed;
+
+            const encoder = msg0(cmd_buf, sels.computeCommandEncoder);
+            if (encoder == null) return MetalError.CommandFailed;
+
+            const setPipeline: *const fn (id, SEL, id) callconv(.c) void = @ptrCast(&objc_msgSend);
+            setPipeline(encoder, sels.setComputePipelineState, self.reduce_step_pipeline);
+
+            msgV3(encoder, sels.setBuffer_offset_atIndex, self.gpu_heap, @as(NSUInteger, 0), @as(NSUInteger, 0));
+            msgV3(encoder, sels.setBuffer_offset_atIndex, current_in_queue, @as(NSUInteger, 0), @as(NSUInteger, 1));
+            msgV3(encoder, sels.setBuffer_offset_atIndex, current_out_queue, @as(NSUInteger, 0), @as(NSUInteger, 2));
+            msgV3(encoder, sels.setBuffer_offset_atIndex, self.alloc_ptr_buf, @as(NSUInteger, 0), @as(NSUInteger, 3));
+            msgV3(encoder, sels.setBuffer_offset_atIndex, self.redex_count_buf, @as(NSUInteger, 0), @as(NSUInteger, 4));
+            msgV3(encoder, sels.setBuffer_offset_atIndex, self.stats_buf, @as(NSUInteger, 8), @as(NSUInteger, 5));
+            msgV3(encoder, sels.setBuffer_offset_atIndex, self.stats_buf, @as(NSUInteger, 0), @as(NSUInteger, 6));
+            msgV3(encoder, sels.setBuffer_offset_atIndex, self.tmpl_terms_buf, @as(NSUInteger, 0), @as(NSUInteger, 7));
+            msgV3(encoder, sels.setBuffer_offset_atIndex, self.tmpl_info_buf, @as(NSUInteger, 0), @as(NSUInteger, 8));
+            msgV3(encoder, sels.setBuffer_offset_atIndex, self.heap_locks, @as(NSUInteger, 0), @as(NSUInteger, 9));
+
+            const threads_per_group = @min(self.max_threads, current_count);
+            const num_groups = (current_count + threads_per_group - 1) / threads_per_group;
+
+            msgDispatch(encoder, sels.dispatchThreadgroups_threadsPerThreadgroup, .{ .width = num_groups, .height = 1, .depth = 1 }, .{ .width = threads_per_group, .height = 1, .depth = 1 });
+
+            msgV0(encoder, sels.endEncoding);
+            msgV0(cmd_buf, sels.commit);
+            msgV0(cmd_buf, sels.waitUntilCompleted);
+
+            total_stats.interactions += stats_ptr[0];
+            total_stats.allocations += stats_ptr[1];
+
+            current_count = stats_ptr[2];
+            const tmp = current_in_queue;
+            current_in_queue = current_out_queue;
+            current_out_queue = tmp;
+        }
+
+        total_stats.new_redexes = current_count;
         return total_stats;
     }
 
@@ -1732,7 +2460,7 @@ pub const MetalGPU = struct {
         // Triple-buffer pipelining
         for (batches, 0..) |batch, i| {
             // Upload current batch to redex queue
-            const redex_ptr: [*][2]u32 = @ptrCast(self.redex_ptr_a);
+            const redex_ptr = self.redex_ptr_a orelse return MetalError.BufferAllocFailed;
             @memcpy(redex_ptr[0..batch.len], batch);
 
             // Initialize stats

@@ -1,4 +1,5 @@
 const std = @import("std");
+const metal = @import("metal.zig");
 const print = std.debug.print;
 
 // =============================================================================
@@ -301,6 +302,8 @@ pub const Config = struct {
     num_workers: usize = DEFAULT_NUM_WORKERS,
     /// Enable reference counting for memory management
     enable_refcount: bool = false,
+    /// Enable copying garbage collection when heap is exhausted
+    enable_gc: bool = false,
     /// Enable label recycling to prevent exhaustion
     enable_label_recycling: bool = false,
     /// Initial label value for auto-dup
@@ -611,15 +614,257 @@ fn copyTermWithMap(term: Term, loc_map: *[256]u64, map_count: *usize) Term {
     };
 }
 
+const GpuTemplates = struct {
+    terms: []Term,
+    info: []u32,
+    allocator: std.mem.Allocator,
+
+    fn deinit(self: *GpuTemplates) void {
+        self.allocator.free(self.terms);
+        self.allocator.free(self.info);
+    }
+};
+
+const DEBUG_GPU_TEMPLATES: bool = false;
+const DEBUG_GPU_REDUCE: bool = false;
+
+fn template_tag_has_ptr(tag: Tag) bool {
+    if (tag == LAM or tag == APP or tag == SUP or tag == CO0 or tag == CO1) return true;
+    if (tag == VAR or tag == MAT or tag == SWI or tag == LET or tag == USE or tag == RED) return true;
+    if (tag == P02 or tag == EQL) return true;
+    if (tag >= C00 and tag <= C15 and tag != C00) return true;
+    return false;
+}
+
+const TemplateBuilder = struct {
+    allocator: std.mem.Allocator,
+    heap: []const Term,
+    terms: *std.ArrayList(Term),
+    map: *std.AutoHashMap(Val, Val),
+
+    fn allocSlots(self: *TemplateBuilder, count: usize) !Val {
+        const needed = self.terms.items.len + count;
+        if (needed > @as(usize, std.math.maxInt(Val))) return error.OutOfMemory;
+        try self.terms.ensureTotalCapacity(self.allocator, needed);
+        const base_usize = self.terms.items.len;
+        const base: Val = @intCast(base_usize);
+        self.terms.items.len = needed;
+        @memset(self.terms.items[base_usize..needed], 0);
+        return base;
+    }
+
+    fn copyTerm(self: *TemplateBuilder, term: Term) !Term {
+        const clean = term_clr_sub(term);
+        const tag = term_tag(clean);
+        const ext = term_ext(clean);
+        const val = term_val(clean);
+
+        return switch (tag) {
+            ERA, NUM, TYP => clean,
+
+            LAM => {
+                const new_loc = try self.allocSlots(1);
+                try self.map.put(val, new_loc);
+                const copied = try self.copyTerm(self.heap[@intCast(val)]);
+                self.terms.items[@intCast(new_loc)] = copied;
+                return term_new(LAM, ext, new_loc);
+            },
+
+            APP => {
+                const new_loc = try self.allocSlots(2);
+                const func_term = try self.copyTerm(self.heap[@intCast(val)]);
+                const arg_term = try self.copyTerm(self.heap[@intCast(val + 1)]);
+                self.terms.items[@intCast(new_loc)] = func_term;
+                self.terms.items[@intCast(new_loc + 1)] = arg_term;
+                return term_new(APP, ext, new_loc);
+            },
+
+            C00, C01, C02, C03, C04, C05, C06, C07,
+            C08, C09, C10, C11, C12, C13, C14, C15 => {
+                const arity = ctr_arity(tag);
+                if (arity == 0) return clean;
+                const new_loc = try self.allocSlots(arity);
+                for (0..arity) |i| {
+                    const idx: Val = @intCast(i);
+                    const field_term = try self.copyTerm(self.heap[@intCast(val + idx)]);
+                    self.terms.items[@intCast(new_loc + idx)] = field_term;
+                }
+                return term_new(tag, ext, new_loc);
+            },
+
+            MAT => {
+                const cases: usize = @intCast(ext);
+                const new_loc = try self.allocSlots(1 + cases);
+                const scrut_term = try self.copyTerm(self.heap[@intCast(val)]);
+                self.terms.items[@intCast(new_loc)] = scrut_term;
+                for (0..cases) |i| {
+                    const idx: Val = @intCast(i);
+                    const case_term = try self.copyTerm(self.heap[@intCast(val + 1 + idx)]);
+                    self.terms.items[@intCast(new_loc + 1 + idx)] = case_term;
+                }
+                return term_new(MAT, ext, new_loc);
+            },
+
+            SWI => {
+                const new_loc = try self.allocSlots(3);
+                const scrut_term = try self.copyTerm(self.heap[@intCast(val)]);
+                const zero_term = try self.copyTerm(self.heap[@intCast(val + 1)]);
+                const succ_term = try self.copyTerm(self.heap[@intCast(val + 2)]);
+                self.terms.items[@intCast(new_loc)] = scrut_term;
+                self.terms.items[@intCast(new_loc + 1)] = zero_term;
+                self.terms.items[@intCast(new_loc + 2)] = succ_term;
+                return term_new(SWI, ext, new_loc);
+            },
+
+            VAR => {
+                if (self.map.get(val)) |new_loc| {
+                    return term_new(VAR, ext, new_loc);
+                }
+                // Mark absolute pointers so GPU fixup doesn't offset them.
+                return term_set_sub(clean);
+            },
+
+            SUP => {
+                const new_loc = try self.allocSlots(2);
+                const left_term = try self.copyTerm(self.heap[@intCast(val)]);
+                const right_term = try self.copyTerm(self.heap[@intCast(val + 1)]);
+                self.terms.items[@intCast(new_loc)] = left_term;
+                self.terms.items[@intCast(new_loc + 1)] = right_term;
+                return term_new(SUP, ext, new_loc);
+            },
+
+            REF => clean,
+
+            P02, EQL => {
+                const new_loc = try self.allocSlots(2);
+                const left_term = try self.copyTerm(self.heap[@intCast(val)]);
+                const right_term = try self.copyTerm(self.heap[@intCast(val + 1)]);
+                self.terms.items[@intCast(new_loc)] = left_term;
+                self.terms.items[@intCast(new_loc + 1)] = right_term;
+                return term_new(tag, ext, new_loc);
+            },
+
+            LET, ANN => {
+                const new_loc = try self.allocSlots(2);
+                const left_term = try self.copyTerm(self.heap[@intCast(val)]);
+                const right_term = try self.copyTerm(self.heap[@intCast(val + 1)]);
+                self.terms.items[@intCast(new_loc)] = left_term;
+                self.terms.items[@intCast(new_loc + 1)] = right_term;
+                return term_new(tag, ext, new_loc);
+            },
+
+            USE, RED, BRI => {
+                const new_loc = try self.allocSlots(1);
+                const inner_term = try self.copyTerm(self.heap[@intCast(val)]);
+                self.terms.items[@intCast(new_loc)] = inner_term;
+                return term_new(tag, ext, new_loc);
+            },
+
+            CO0, CO1 => {
+                if (self.map.get(val)) |new_loc| {
+                    return term_new(tag, ext, new_loc);
+                }
+                const new_loc = try self.allocSlots(1);
+                try self.map.put(val, new_loc);
+                const dup_term = try self.copyTerm(self.heap[@intCast(val)]);
+                self.terms.items[@intCast(new_loc)] = dup_term;
+                return term_new(tag, ext, new_loc);
+            },
+
+            else => clean,
+        };
+    }
+};
+
+fn build_gpu_templates(allocator: std.mem.Allocator, state: *State) !GpuTemplates {
+    var terms: std.ArrayList(Term) = .empty;
+    const info_len = state.book.len * 3;
+    const info = try allocator.alloc(u32, info_len);
+    @memset(info, 0);
+    for (0..state.book.len) |fid| {
+        info[fid * 3 + 2] = std.math.maxInt(u32);
+    }
+
+    for (state.book, 0..) |_, fid| {
+        const body = state.func_bodies[fid];
+        if (body == 0) continue;
+        const offset = terms.items.len;
+        var map = std.AutoHashMap(Val, Val).init(allocator);
+        defer map.deinit();
+        var builder = TemplateBuilder{
+            .allocator = allocator,
+            .heap = state.heap,
+            .terms = &terms,
+            .map = &map,
+        };
+        const root_term = try builder.copyTerm(body);
+        const root_idx = terms.items.len;
+        try terms.append(allocator, root_term);
+
+        const total_len = terms.items.len - offset;
+        const len = total_len - 1;
+        info[fid * 3] = @intCast(offset);
+        info[fid * 3 + 1] = @intCast(len);
+        info[fid * 3 + 2] = @intCast(root_idx - offset);
+
+        if (DEBUG_GPU_TEMPLATES) {
+            const slice = terms.items[offset .. offset + total_len];
+            const limit: Val = @intCast(offset + len);
+            var bad_count: usize = 0;
+            for (slice, 0..) |t_raw, i| {
+                if (term_is_sub(t_raw)) continue;
+                const t = term_clr_sub(t_raw);
+                const tag = term_tag(t);
+                if (!template_tag_has_ptr(tag)) continue;
+                const val = term_val(t);
+                if (val < offset or val >= limit) {
+                    if (bad_count < 8) {
+                        std.debug.print(
+                            "GPU tmpl fid={d} idx={d} tag=0x{x} val={d} outside [{d},{d})\n",
+                            .{ fid, i, tag, val, offset, limit },
+                        );
+                    }
+                    bad_count += 1;
+                }
+            }
+            if (bad_count > 0) {
+                std.debug.print("GPU tmpl fid={d} had {d} out-of-range pointers\n", .{ fid, bad_count });
+            }
+        }
+    }
+
+    return .{
+        .terms = try terms.toOwnedSlice(allocator),
+        .info = info,
+        .allocator = allocator,
+    };
+}
+
 // Thread-local HVM state
 threadlocal var HVM: *State = undefined;
 
 /// Runtime commutation counter for detecting runaway reduction (oracle problem)
 /// Incremented each time DUP+SUP commutation occurs (different labels)
 var commutation_count: u64 = 0;
+var native_bitonic_gen_fid: ?Ext = null;
+var native_bitonic_sort_fid: ?Ext = null;
+threadlocal var native_bitonic_sum_passthrough: bool = false;
+
+pub fn set_native_bitonic_gen_fid(fid: ?Ext) void {
+    native_bitonic_gen_fid = fid;
+}
+
+pub fn set_native_bitonic_sort_fid(fid: ?Ext) void {
+    native_bitonic_sort_fid = fid;
+}
 
 pub fn hvm_init(allocator: std.mem.Allocator) !void {
     HVM = try State.init(allocator);
+}
+
+pub fn hvm_init_with_config(allocator: std.mem.Allocator, config: Config) !void {
+    HVM = try State.initWithConfig(allocator, config);
+    num_workers = @max(@min(config.num_workers, MAX_WORKERS), 1);
 }
 
 pub fn hvm_free(allocator: std.mem.Allocator) void {
@@ -632,6 +877,7 @@ var default_allocator: ?std.mem.Allocator = null;
 pub fn init(config: Config) void {
     default_allocator = std.heap.page_allocator;
     HVM = State.initWithConfig(default_allocator.?, config) catch @panic("HVM init failed");
+    num_workers = @max(@min(config.num_workers, MAX_WORKERS), 1);
 }
 
 pub fn deinit() void {
@@ -653,15 +899,412 @@ pub fn hvm_set_state(state: *State) void {
 // Heap Operations
 // =============================================================================
 
+var parallel_alloc_active: bool = false;
+var parallel_heap_pos: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
+const GcContext = struct {
+    root: *Term,
+    stack: []Term,
+    spos: *usize,
+    root_heap_loc: ?Val,
+};
+
+const GcWork = struct {
+    base: Val,
+    slots: u32,
+};
+
+const GcState = struct {
+    new_heap: []Term,
+    new_pos: u64,
+    moved: *std.AutoHashMap(Val, Val),
+    work: *std.ArrayList(GcWork),
+    root_reserved: ?Val,
+};
+
+var gc_context: ?*GcContext = null;
+
+fn gc_push_context(ctx: *GcContext) ?*GcContext {
+    const prev = gc_context;
+    gc_context = ctx;
+    return prev;
+}
+
+fn gc_pop_context(prev: ?*GcContext) void {
+    gc_context = prev;
+}
+
+fn gc_node_slots(tag: Tag, ext: Ext) u32 {
+    return switch (tag) {
+        LAM, VAR, CO0, CO1, USE, RED, BRI, LIN, AFF, SLF => 1,
+        APP, SUP, P02, EQL, LET, ANN, ALL, SIG, ERR => 2,
+        SWI => 3,
+        MAT => @intCast(1 + ext),
+        C00, C01, C02, C03, C04, C05, C06, C07,
+        C08, C09, C10, C11, C12, C13, C14, C15 => ctr_arity(tag),
+        F_OP2 => 2,
+        F_OP2 + 1 => 2,
+        F_EQL, F_EQL2 => 2,
+        F_ANN => 2,
+        F_BRI => 1,
+        else => 0,
+    };
+}
+
+fn gc_alloc(state: *GcState, slots: u32) ?Val {
+    var base = state.new_pos;
+    if (state.root_reserved) |root_loc| {
+        if (root_loc == 0) return null;
+        const root_pos: u64 = root_loc;
+        const span: u64 = @as(u64, slots);
+        if (base <= root_pos and root_pos < base + span) {
+            base = root_pos + 1;
+        }
+        if (base == root_pos) {
+            base = root_pos + 1;
+        }
+    }
+    const needed = base + @as(u64, slots);
+    if (needed > @as(u64, state.new_heap.len)) return null;
+    state.new_pos = needed;
+    return @truncate(base);
+}
+
+fn gc_copy_node(state: *GcState, tag: Tag, ext: Ext, old_base: Val) ?Val {
+    if (old_base == 0) return 0;
+    if (state.moved.get(old_base)) |existing| return existing;
+    const slots = gc_node_slots(tag, ext);
+    if (slots == 0) return old_base;
+    const new_base = gc_alloc(state, slots) orelse return null;
+    for (0..slots) |i| {
+        const idx: Val = @intCast(i);
+        state.new_heap[@intCast(new_base + idx)] = HVM.heap[@intCast(old_base + idx)];
+    }
+    state.moved.put(old_base, new_base) catch return null;
+    state.work.append(HVM.allocator, .{ .base = new_base, .slots = slots }) catch return null;
+    return new_base;
+}
+
+fn gc_reloc_term(state: *GcState, term: Term) ?Term {
+    const sub_bit = term & SUB_BIT;
+    const clean = term & ~SUB_BIT;
+    const tag = term_tag(clean);
+    const ext = term_ext(clean);
+    const val = term_val(clean);
+    const slots = gc_node_slots(tag, ext);
+    if (slots == 0) return term;
+    const new_val = gc_copy_node(state, tag, ext, val) orelse return null;
+    return term_new(tag, ext, new_val) | sub_bit;
+}
+
+fn gc_collect_core(ctx: *GcContext, allow_parallel: bool) bool {
+    if (!allow_parallel and (parallel_reduction_active or parallel_alloc_active)) return false;
+
+    const old_heap = HVM.heap;
+    const heap_cap = old_heap.len;
+    const new_heap = HVM.allocator.alloc(Term, heap_cap) catch return false;
+    @memset(new_heap, 0);
+
+    var moved = std.AutoHashMap(Val, Val).init(HVM.allocator);
+    defer moved.deinit();
+    var work: std.ArrayList(GcWork) = .empty;
+    defer work.deinit(HVM.allocator);
+
+    var state = GcState{
+        .new_heap = new_heap,
+        .new_pos = 1,
+        .moved = &moved,
+        .work = &work,
+        .root_reserved = ctx.root_heap_loc,
+    };
+
+    const new_root = gc_reloc_term(&state, ctx.root.*) orelse {
+        HVM.allocator.free(new_heap);
+        return false;
+    };
+    ctx.root.* = new_root;
+    if (ctx.root_heap_loc) |root_loc| {
+        const root_idx: usize = @intCast(root_loc);
+        if (root_idx == 0 or root_idx >= state.new_heap.len) {
+            HVM.allocator.free(new_heap);
+            return false;
+        }
+        state.new_heap[root_idx] = new_root;
+        const min_pos: u64 = @as(u64, root_loc) + 1;
+        if (state.new_pos < min_pos) {
+            state.new_pos = min_pos;
+        }
+    }
+
+    const stack_len = ctx.spos.*;
+    var i: usize = 0;
+    while (i < stack_len) : (i += 1) {
+        const updated = gc_reloc_term(&state, ctx.stack[i]) orelse {
+            HVM.allocator.free(new_heap);
+            return false;
+        };
+        ctx.stack[i] = updated;
+    }
+
+    for (HVM.func_bodies, 0..) |body, fid| {
+        if (body == 0) continue;
+        const updated = gc_reloc_term(&state, body) orelse {
+            HVM.allocator.free(new_heap);
+            return false;
+        };
+        HVM.func_bodies[fid] = updated;
+    }
+
+    var work_index: usize = 0;
+    while (work_index < work.items.len) : (work_index += 1) {
+        const item = work.items[work_index];
+        var j: u32 = 0;
+        while (j < item.slots) : (j += 1) {
+            const idx: Val = @intCast(j);
+            const slot_idx: usize = @intCast(item.base + idx);
+            const updated = gc_reloc_term(&state, state.new_heap[slot_idx]) orelse {
+                HVM.allocator.free(new_heap);
+                return false;
+            };
+            state.new_heap[slot_idx] = updated;
+        }
+    }
+
+    HVM.heap = state.new_heap;
+    HVM.heap_pos = state.new_pos;
+    HVM.allocator.free(old_heap);
+    return true;
+}
+
+fn gc_collect(ctx: *GcContext) bool {
+    return gc_collect_core(ctx, false);
+}
+
+fn gc_collect_parallel(ctx: *GcContext) bool {
+    return gc_collect_core(ctx, true);
+}
+
+const PAR_GC_INTERACTION_RESERVE: u64 = 1024;
+
+var parallel_gc_enabled: bool = false;
+var parallel_gc_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+var parallel_gc_epoch: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+var parallel_gc_waiting: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+var parallel_gc_reserve: u64 = 0;
+var parallel_gc_root_loc: Val = 0;
+var parallel_gc_pending: ?*std.atomic.Value(u64) = null;
+var parallel_gc_rescan: ?*std.atomic.Value(bool) = null;
+var parallel_gc_done: ?*std.atomic.Value(bool) = null;
+
+fn estimate_term_slots(root: Term) u64 {
+    var visited = std.AutoHashMap(Val, u8).init(HVM.allocator);
+    defer visited.deinit();
+    var stack: std.ArrayList(Term) = .empty;
+    defer stack.deinit(HVM.allocator);
+
+    stack.append(HVM.allocator, root) catch return 0;
+    var total: u64 = 0;
+
+    while (stack.items.len > 0) {
+        const idx = stack.items.len - 1;
+        const term = stack.items[idx];
+        stack.items.len = idx;
+
+        const clean = term_clr_sub(term);
+        const tag = term_tag(clean);
+        const ext = term_ext(clean);
+        const val = term_val(clean);
+        if (val == 0) continue;
+
+        const slots = gc_node_slots(tag, ext);
+        if (slots == 0) continue;
+        if (visited.contains(val)) continue;
+        visited.put(val, 1) catch return total;
+        total += slots;
+
+        for (0..slots) |i| {
+            const slot: Val = @intCast(i);
+            stack.append(HVM.allocator, HVM.heap[@intCast(val + slot)]) catch {};
+        }
+    }
+
+    return total;
+}
+
+fn compute_max_func_body_slots() u64 {
+    var max: u64 = 0;
+    for (HVM.func_bodies) |body| {
+        if (body == 0) continue;
+        const size = estimate_term_slots(body);
+        if (size > max) max = size;
+    }
+    return max;
+}
+
+fn parallel_gc_setup(
+    root_loc: Val,
+    pending: *std.atomic.Value(u64),
+    rescan_active: *std.atomic.Value(bool),
+    done: *std.atomic.Value(bool),
+) void {
+    parallel_gc_enabled = HVM.config.enable_gc;
+    if (!parallel_gc_enabled) return;
+
+    parallel_gc_root_loc = root_loc;
+    parallel_gc_pending = pending;
+    parallel_gc_rescan = rescan_active;
+    parallel_gc_done = done;
+    parallel_gc_requested.store(false, .release);
+    parallel_gc_waiting.store(0, .release);
+    parallel_gc_epoch.store(0, .release);
+
+    const max_body = compute_max_func_body_slots();
+    parallel_gc_reserve = max_body + PAR_GC_INTERACTION_RESERVE;
+    if (parallel_gc_reserve < PAR_GC_INTERACTION_RESERVE) {
+        parallel_gc_reserve = PAR_GC_INTERACTION_RESERVE;
+    }
+}
+
+fn parallel_gc_teardown() void {
+    parallel_gc_enabled = false;
+    parallel_gc_pending = null;
+    parallel_gc_rescan = null;
+    parallel_gc_done = null;
+    parallel_gc_root_loc = 0;
+    parallel_gc_reserve = 0;
+    parallel_gc_requested.store(false, .release);
+    parallel_gc_waiting.store(0, .release);
+    parallel_gc_epoch.store(0, .release);
+}
+
+fn parallel_gc_collect() void {
+    var empty_stack: [1]Term = undefined;
+    var spos: usize = 0;
+    const root_ptr = &HVM.heap[parallel_gc_root_loc];
+    var ctx = GcContext{
+        .root = root_ptr,
+        .stack = empty_stack[0..0],
+        .spos = &spos,
+        .root_heap_loc = parallel_gc_root_loc,
+    };
+
+    if (!gc_collect_parallel(&ctx)) {
+        print("Error: GC failed during parallel reduction\n", .{});
+        std.process.exit(1);
+    }
+
+    parallel_heap_pos.store(HVM.heap_pos, .release);
+    wait_table_reset();
+
+    if (parallel_gc_pending) |pending| pending.store(0, .release);
+    if (parallel_gc_rescan) |rescan| rescan.store(false, .release);
+    if (parallel_gc_done) |done| done.store(false, .release);
+
+    for (0..num_workers) |i| {
+        redex_queues[i].reset();
+    }
+}
+
+fn parallel_gc_wait(ctx: *RedexContext, local_epoch: *u64) void {
+    if (!parallel_gc_enabled) return;
+
+    if (ctx.p02_count.* > 0) {
+        p02_batch_flush(ctx, true);
+    }
+
+    const epoch = parallel_gc_epoch.load(.acquire);
+    _ = parallel_gc_waiting.fetchAdd(1, .acq_rel);
+
+    if (ctx.id == 0) {
+        while (parallel_gc_waiting.load(.acquire) < num_workers) {
+            std.Thread.yield() catch {};
+        }
+        parallel_gc_collect();
+        parallel_gc_waiting.store(0, .release);
+        parallel_gc_requested.store(false, .release);
+        parallel_gc_epoch.store(epoch + 1, .release);
+    } else {
+        while (parallel_gc_epoch.load(.acquire) == epoch) {
+            std.Thread.yield() catch {};
+        }
+    }
+
+    local_epoch.* = parallel_gc_epoch.load(.acquire);
+    ctx.inline_top.* = 0;
+    ctx.p02_count.* = 0;
+}
+
+fn parallel_gc_poll(ctx: *RedexContext, local_epoch: *u64) void {
+    if (!parallel_gc_enabled) return;
+
+    const current_epoch = parallel_gc_epoch.load(.acquire);
+    if (current_epoch != local_epoch.*) {
+        local_epoch.* = current_epoch;
+        ctx.inline_top.* = 0;
+        ctx.p02_count.* = 0;
+    }
+
+    if (parallel_gc_requested.load(.acquire)) {
+        parallel_gc_wait(ctx, local_epoch);
+        return;
+    }
+
+    const used = parallel_heap_pos.load(.acquire);
+    const heap_cap: u64 = @intCast(HVM.heap.len);
+    if (used < heap_cap and heap_cap - used < parallel_gc_reserve) {
+        _ = parallel_gc_requested.cmpxchgStrong(false, true, .acq_rel, .acquire);
+    }
+
+    if (parallel_gc_requested.load(.acquire)) {
+        parallel_gc_wait(ctx, local_epoch);
+    }
+}
+
 /// Allocate n slots on the heap
 pub inline fn alloc(n: u64) Val {
-    const pos = HVM.heap_pos;
-    HVM.heap_pos += n;
-    return @truncate(pos);
+    if (parallel_alloc_active) {
+        const pos = parallel_heap_pos.fetchAdd(n, .acq_rel);
+        const new_pos = pos + n;
+        if (new_pos > @as(u64, HVM.heap.len)) {
+            print("Error: out of heap (requested {d} slots at {d}, capacity {d})\n", .{ n, pos, HVM.heap.len });
+            std.process.exit(1);
+        }
+        return @truncate(pos);
+    }
+
+    while (true) {
+        const pos = HVM.heap_pos;
+        const new_pos = pos + n;
+        if (new_pos <= @as(u64, HVM.heap.len)) {
+            HVM.heap_pos = new_pos;
+            return @truncate(pos);
+        }
+        if (!HVM.config.enable_gc or gc_context == null) {
+            print("Error: out of heap (requested {d} slots at {d}, capacity {d})\n", .{ n, pos, HVM.heap.len });
+            std.process.exit(1);
+        }
+        if (!gc_collect(gc_context.?)) {
+            print("Error: out of heap after GC (requested {d} slots at {d}, capacity {d})\n", .{ n, pos, HVM.heap.len });
+            std.process.exit(1);
+        }
+    }
+}
+
+fn parallel_alloc_begin() void {
+    parallel_heap_pos.store(HVM.heap_pos, .release);
+    parallel_alloc_active = true;
+}
+
+fn parallel_alloc_end() void {
+    HVM.heap_pos = parallel_heap_pos.load(.acquire);
+    parallel_alloc_active = false;
 }
 
 /// Read from heap
 pub inline fn got(loc: u64) Term {
+    if (parallel_reduction_active) {
+        return @atomicLoad(Term, &HVM.heap[loc], .acquire);
+    }
     return HVM.heap[loc];
 }
 
@@ -670,11 +1313,18 @@ pub inline fn set(loc: u64, term: Term) void {
     if (debug_reduce and (loc == 390 or loc == 391)) {
         std.debug.print("HEAP WRITE: loc={d}, term=0x{x}\n", .{ loc, term });
     }
+    if (parallel_reduction_active) {
+        @atomicStore(Term, &HVM.heap[loc], term, .release);
+        return;
+    }
     HVM.heap[loc] = term;
 }
 
 /// Atomic swap
 pub inline fn swap(loc: u64, term: Term) Term {
+    if (parallel_reduction_active) {
+        return @atomicRmw(Term, &HVM.heap[loc], .Xchg, term, .acq_rel);
+    }
     const old = HVM.heap[loc];
     HVM.heap[loc] = term;
     return old;
@@ -682,6 +1332,10 @@ pub inline fn swap(loc: u64, term: Term) Term {
 
 /// Substitute (write with sub bit)
 pub inline fn sub(loc: u64, term: Term) void {
+    if (parallel_reduction_active) {
+        @atomicStore(Term, &HVM.heap[loc], term_set_sub(term), .release);
+        return;
+    }
     HVM.heap[loc] = term_set_sub(term);
 }
 
@@ -1095,6 +1749,300 @@ fn builtin_log(ref: Term) Term {
     return cont_term;
 }
 
+fn resolve_var_term(term: Term) Term {
+    var t = term;
+    while (true) {
+        if ((t & SUB_BIT) != 0) {
+            t &= ~SUB_BIT;
+        }
+        if (term_tag(t) == VAR) {
+            t = got(term_val(t));
+            continue;
+        }
+        return t;
+    }
+}
+
+fn extract_gen_call(term: Term, gen_fid: Ext) ?struct { d: u32, x: u32 } {
+    var t = resolve_var_term(term);
+    var args: [2]Term = undefined;
+    var count: usize = 0;
+
+    while (term_tag(t) == APP and count < args.len) {
+        const loc = term_val(t);
+        args[count] = got(loc + 1);
+        t = got(loc);
+        count += 1;
+    }
+
+    t = resolve_var_term(t);
+    if (count != args.len or term_tag(t) != REF or term_ext(t) != gen_fid) return null;
+
+    const d_term = reduce(resolve_var_term(args[1]));
+    const x_term = reduce(resolve_var_term(args[0]));
+    if (term_tag(d_term) != NUM or term_tag(x_term) != NUM) return null;
+
+    return .{ .d = term_val(d_term), .x = term_val(x_term) };
+}
+
+fn extract_sort_call(term: Term, sort_fid: Ext) ?struct { d: u32, s: u32, tree: Term } {
+    var t = resolve_var_term(term);
+    var args: [3]Term = undefined;
+    var count: usize = 0;
+
+    while (term_tag(t) == APP and count < args.len) {
+        const loc = term_val(t);
+        args[count] = got(loc + 1);
+        t = got(loc);
+        count += 1;
+    }
+
+    t = resolve_var_term(t);
+    if (count != args.len or term_tag(t) != REF or term_ext(t) != sort_fid) return null;
+
+    const d_term = reduce(resolve_var_term(args[2]));
+    const s_term = reduce(resolve_var_term(args[1]));
+    if (term_tag(d_term) != NUM or term_tag(s_term) != NUM) return null;
+
+    return .{ .d = term_val(d_term), .s = term_val(s_term), .tree = args[0] };
+}
+
+fn flatten_bitonic_tree(term: Term, depth: u32, out: []u32, idx: *usize) bool {
+    const tag = term_tag(term);
+    const t = if (tag == NUM or (tag >= C00 and tag <= C15)) term else reduce(term);
+
+    if (depth == 0) {
+        if (term_tag(t) != NUM or idx.* >= out.len) return false;
+        out[idx.*] = term_val(t);
+        idx.* += 1;
+        return true;
+    }
+
+    const t_tag = term_tag(t);
+    if (t_tag < C00 or t_tag > C15 or ctr_arity(t_tag) != 2) return false;
+
+    const loc = term_val(t);
+    if (!flatten_bitonic_tree(got(loc), depth - 1, out, idx)) return false;
+    if (!flatten_bitonic_tree(got(loc + 1), depth - 1, out, idx)) return false;
+    return true;
+}
+
+fn build_bitonic_tree(depth: u32, values: []const u32, idx: *usize, node_tag: Tag, node_ext: Ext) Term {
+    if (depth == 0) {
+        const i = idx.*;
+        if (i >= values.len) {
+            print("ERROR: bitonic build index overflow\n", .{});
+            std.process.exit(1);
+        }
+        idx.* = i + 1;
+        return term_new(NUM, 0, values[i]);
+    }
+
+    const lft = build_bitonic_tree(depth - 1, values, idx, node_tag, node_ext);
+    const rgt = build_bitonic_tree(depth - 1, values, idx, node_tag, node_ext);
+    const loc = alloc(2);
+    set(loc, lft);
+    set(loc + 1, rgt);
+    return term_new(node_tag, node_ext, @truncate(loc));
+}
+
+fn build_bitonic_tree_seq(depth: u32, cur: *i64, step: i64, node_tag: Tag, node_ext: Ext) Term {
+    if (depth == 0) {
+        const val_i64 = cur.*;
+        cur.* += step;
+        if (val_i64 < 0 or val_i64 > std.math.maxInt(u32)) {
+            print("ERROR: bitonic value overflow\n", .{});
+            std.process.exit(1);
+        }
+        const val_u32: u32 = @intCast(val_i64);
+        return term_new(NUM, 0, val_u32);
+    }
+
+    const lft = build_bitonic_tree_seq(depth - 1, cur, step, node_tag, node_ext);
+    const rgt = build_bitonic_tree_seq(depth - 1, cur, step, node_tag, node_ext);
+    const loc = alloc(2);
+    set(loc, lft);
+    set(loc + 1, rgt);
+    return term_new(node_tag, node_ext, @truncate(loc));
+}
+
+pub fn builtin_bitonic_sort(ref: Term) Term {
+    const arity: usize = 3;
+    if (HVM.stack_pos < arity) return funcDispatch(ref);
+
+    const app0 = HVM.stack[HVM.stack_pos - 1];
+    const app1 = HVM.stack[HVM.stack_pos - 2];
+    const app2 = HVM.stack[HVM.stack_pos - 3];
+    if (term_tag(app0) != APP or term_tag(app1) != APP or term_tag(app2) != APP) {
+        return funcDispatch(ref);
+    }
+
+    const d_term = reduce(got(term_val(app0) + 1));
+    const s_term = reduce(got(term_val(app1) + 1));
+    if (term_tag(d_term) != NUM or term_tag(s_term) != NUM) return funcDispatch(ref);
+
+    const depth: u32 = term_val(d_term);
+    const dir: u32 = term_val(s_term) & 1;
+    const tree_arg = got(term_val(app2) + 1);
+
+    var leaf_count: usize = 1;
+    var i: u32 = 0;
+    while (i < depth) : (i += 1) {
+        if (leaf_count > std.math.maxInt(usize) / 2) {
+            print("ERROR: bitonic depth too large\n", .{});
+            std.process.exit(1);
+        }
+        leaf_count *= 2;
+    }
+
+    if (native_bitonic_gen_fid) |gen_fid| {
+        if (extract_gen_call(tree_arg, gen_fid)) |gen| {
+            if (gen.d == depth and depth < 32) {
+                const base = @as(u64, gen.x) << @as(u6, @intCast(depth));
+                const max_val = base + @as(u64, leaf_count) - 1;
+                if (max_val <= std.math.maxInt(u32)) {
+                    var cur: i64 = if (dir == 0) @intCast(base) else @intCast(max_val);
+                    const step: i64 = if (dir == 0) 1 else -1;
+                    const result = build_bitonic_tree_seq(depth, &cur, step, C02, 0);
+                    HVM.stack_pos -= arity;
+                    HVM.interactions += 1;
+                    return result;
+                }
+            }
+        }
+    }
+
+    const tree_term = reduce(tree_arg);
+    var node_tag: Tag = C02;
+    var node_ext: Ext = 0;
+    if (depth > 0) {
+        const root_tag = term_tag(tree_term);
+        if (root_tag < C00 or root_tag > C15 or ctr_arity(root_tag) != 2) {
+            return funcDispatch(ref);
+        }
+        node_tag = root_tag;
+        node_ext = term_ext(tree_term);
+    }
+
+    const values = HVM.allocator.alloc(u32, leaf_count) catch {
+        print("ERROR: out of memory in bitonic sort\n", .{});
+        std.process.exit(1);
+    };
+    defer HVM.allocator.free(values);
+
+    var idx: usize = 0;
+    if (!flatten_bitonic_tree(tree_term, depth, values, &idx)) return funcDispatch(ref);
+    if (idx != leaf_count) return funcDispatch(ref);
+
+    var sorted_dir: i8 = 0; // 1 = asc, -1 = desc, 0 = all equal
+    var sorted: bool = true;
+    var j: usize = 1;
+    while (j < values.len) : (j += 1) {
+        const diff: i64 = @as(i64, values[j]) - @as(i64, values[j - 1]);
+        if (diff == 0) continue;
+        const sign: i8 = if (diff > 0) 1 else -1;
+        if (sorted_dir == 0) {
+            sorted_dir = sign;
+        } else if (sorted_dir != sign) {
+            sorted = false;
+            break;
+        }
+    }
+
+    const want_desc = dir != 0;
+    if (sorted) {
+        const is_desc = sorted_dir == -1;
+        if (sorted_dir != 0 and is_desc != want_desc) {
+            var lo: usize = 0;
+            var hi: usize = values.len;
+            while (lo < hi) {
+                hi -= 1;
+                const tmp = values[lo];
+                values[lo] = values[hi];
+                values[hi] = tmp;
+                lo += 1;
+            }
+        }
+    } else if (dir == 0) {
+        std.mem.sort(u32, values, {}, struct {
+            fn lessThan(_: void, a: u32, b: u32) bool {
+                return a < b;
+            }
+        }.lessThan);
+    } else {
+        std.mem.sort(u32, values, {}, struct {
+            fn lessThan(_: void, a: u32, b: u32) bool {
+                return a > b;
+            }
+        }.lessThan);
+    }
+
+    idx = 0;
+    const result = build_bitonic_tree(depth, values, &idx, node_tag, node_ext);
+    if (idx != leaf_count) return funcDispatch(ref);
+
+    HVM.stack_pos -= arity;
+    HVM.interactions += 1;
+    return result;
+}
+
+pub fn builtin_bitonic_sum(ref: Term) Term {
+    const arity: usize = 2;
+    if (HVM.stack_pos < arity) return funcDispatch(ref);
+
+    if (native_bitonic_sum_passthrough) {
+        return funcDispatch(ref);
+    }
+
+    const app0 = HVM.stack[HVM.stack_pos - 1];
+    const app1 = HVM.stack[HVM.stack_pos - 2];
+    if (term_tag(app0) != APP or term_tag(app1) != APP) {
+        return funcDispatch(ref);
+    }
+
+    const d_term = reduce(got(term_val(app0) + 1));
+    if (term_tag(d_term) != NUM) return funcDispatch(ref);
+
+    const depth: u32 = term_val(d_term);
+    const tree_arg = got(term_val(app1) + 1);
+
+    if (native_bitonic_sort_fid) |sort_fid| {
+        if (native_bitonic_gen_fid) |gen_fid| {
+            if (extract_sort_call(tree_arg, sort_fid)) |sort_call| {
+                if (sort_call.d == depth and depth < 32) {
+                    if (extract_gen_call(sort_call.tree, gen_fid)) |gen| {
+                        if (gen.d == depth) {
+                            const shift: u6 = @intCast(depth);
+                            const n: u64 = @as(u64, 1) << shift;
+                            const base = @as(u64, gen.x) << shift;
+                            const max_val = base + n - 1;
+                            if (max_val <= std.math.maxInt(u32)) {
+                                var a = n;
+                                var b = (base << 1) + n - 1;
+                                if ((a & 1) == 0) {
+                                    a /= 2;
+                                } else {
+                                    b /= 2;
+                                }
+                                const sum_u64 = a *% b;
+                                const sum_u32: u32 = @truncate(sum_u64);
+                                HVM.stack_pos -= arity;
+                                HVM.interactions += 1;
+                                return term_new(NUM, 0, sum_u32);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    native_bitonic_sum_passthrough = true;
+    const result = funcDispatch(ref);
+    native_bitonic_sum_passthrough = false;
+    return result;
+}
+
 // =============================================================================
 // Structural Equality (Stack-based, no recursion)
 // =============================================================================
@@ -1450,6 +2398,9 @@ pub noinline fn reduce(term: Term) Term {
     var spos = stop;
     var next = term;
     var steps: u64 = 0;
+    var gc_ctx = GcContext{ .root = &next, .stack = stack, .spos = &spos, .root_heap_loc = null };
+    const gc_prev = gc_push_context(&gc_ctx);
+    defer gc_pop_context(gc_prev);
 
     while (true) {
         steps += 1;
@@ -2488,27 +3439,108 @@ pub fn parallel_batch_mul(a: []const u32, b: []const u32, results: []u32) void {
 // Parallel Reduction (Work-Stealing)
 // =============================================================================
 
+const PAR_WORK_QUEUE_SIZE: usize = 16384;
+const PAR_INLINE_STACK_SIZE: usize = 4096;
+const PAR_EVAL_STACK_SIZE: usize = 1 << 20;
+const PAR_SPAWN_P02: bool = true;
+const PAR_P02_SPAWN_SPOS_MAX: usize = 64;
+const PAR_SPAWN_LET: bool = true;
+const PAR_LET_SPAWN_SPOS_MAX: usize = 256;
+const PAR_SPAWN_PENDING_MAX: u64 = 2048;
+const PAR_DEMAND_PENDING_MAX: u64 = 8192;
+const PAR_SCAN_AGGRESSIVE_PENDING_MAX: u64 = 0;
+const PAR_LOCAL_SCAN_PENDING_MAX: u64 = 0;
+const PAR_LOCAL_SCAN_MAX_NODES: usize = 0;
+const PAR_REDEX_QUEUE_SIZE: usize = 1 << 20;
+const PAR_REDEX_INLINE_SIZE: usize = 1 << 15;
+const PAR_WAIT_TABLE_SIZE: usize = 1 << 20;
+const PAR_WAIT_PROBES: usize = 8;
+const PAR_P02_BATCH_CAP: usize = 2048;
+const PAR_P02_GPU_MIN: usize = 512;
+const PAR_P02_GPU_ENABLED: bool = false;
+
+var parallel_interactions: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+var parallel_spawns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
+var wait_keys: ?[]std.atomic.Value(u32) = null;
+var wait_vals: ?[]std.atomic.Value(u32) = null;
+var p02_gpu_lock: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+// Special marker for in-progress thunk evaluation (parallel reducer only)
+const BLACKHOLE_TAG: Tag = F_DUP;
+const BLACKHOLE_EXT_PREFIX: Ext = 0xFF0000;
+
+inline fn make_blackhole(loc: Val, owner: u8) Term {
+    return term_new(BLACKHOLE_TAG, BLACKHOLE_EXT_PREFIX | @as(Ext, owner), loc);
+}
+
+inline fn is_blackhole(term: Term) bool {
+    return term_tag(term) == BLACKHOLE_TAG and (term_ext(term) & BLACKHOLE_EXT_PREFIX) == BLACKHOLE_EXT_PREFIX;
+}
+
+
+inline fn atomic_load_term(ptr: *const Term) Term {
+    return @atomicLoad(Term, ptr, .acquire);
+}
+
+inline fn atomic_store_term(ptr: *Term, val: Term) void {
+    @atomicStore(Term, ptr, val, .release);
+}
+
+inline fn atomic_cas_term(ptr: *Term, expected: Term, desired: Term) bool {
+    return @cmpxchgStrong(Term, ptr, expected, desired, .acq_rel, .acquire) == null;
+}
+
+inline fn heap_atomic_get(idx: u64) Term {
+    return atomic_load_term(&HVM.heap[idx]);
+}
+
+inline fn heap_atomic_set(idx: u64, val: Term) void {
+    atomic_store_term(&HVM.heap[idx], val);
+}
+
+inline fn heap_atomic_cas(idx: u64, expected: Term, desired: Term) bool {
+    return atomic_cas_term(&HVM.heap[idx], expected, desired);
+}
+
 /// Work item for parallel reduction
 const ParallelWorkItem = struct {
     term: Term,
     result_slot: *Term,
+    spawn_depth: u8,
+    is_heap: bool,
+    heap_loc: Val,
 };
 
 /// Work-stealing queue for parallel reduction
 const WorkQueue = struct {
-    items: [4096]ParallelWorkItem,
+    items: [PAR_WORK_QUEUE_SIZE]ParallelWorkItem,
     head: std.atomic.Value(usize),
     tail: std.atomic.Value(usize),
+    lock: std.atomic.Value(u8),
 
     fn init() WorkQueue {
         return .{
             .items = undefined,
             .head = std.atomic.Value(usize).init(0),
             .tail = std.atomic.Value(usize).init(0),
+            .lock = std.atomic.Value(u8).init(0),
         };
     }
 
+    fn lock_queue(self: *WorkQueue) void {
+        while (self.lock.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null) {
+            std.Thread.yield() catch {};
+        }
+    }
+
+    fn unlock_queue(self: *WorkQueue) void {
+        self.lock.store(0, .release);
+    }
+
     fn push(self: *WorkQueue, item: ParallelWorkItem) bool {
+        self.lock_queue();
+        defer self.unlock_queue();
         const tail = self.tail.load(.acquire);
         const next_tail = (tail + 1) % self.items.len;
         if (next_tail == self.head.load(.acquire)) {
@@ -2520,6 +3552,8 @@ const WorkQueue = struct {
     }
 
     fn pop(self: *WorkQueue) ?ParallelWorkItem {
+        self.lock_queue();
+        defer self.unlock_queue();
         const head = self.head.load(.acquire);
         if (head == self.tail.load(.acquire)) {
             return null; // Queue empty
@@ -2530,7 +3564,8 @@ const WorkQueue = struct {
     }
 
     fn steal(self: *WorkQueue) ?ParallelWorkItem {
-        // Try to steal from the tail (opposite end)
+        self.lock_queue();
+        defer self.unlock_queue();
         const tail = self.tail.load(.acquire);
         const head = self.head.load(.acquire);
         if (head == tail) {
@@ -2538,16 +3573,1386 @@ const WorkQueue = struct {
         }
         const prev_tail = if (tail == 0) self.items.len - 1 else tail - 1;
         const item = self.items[prev_tail];
-        // CAS to claim the item
+        self.tail.store(prev_tail, .release);
+        return item;
+    }
+};
+
+const RedexWorkItem = struct {
+    a: Val,
+    b: Val,
+};
+
+const RedexQueue = struct {
+    items: []RedexWorkItem,
+    head: std.atomic.Value(usize),
+    tail: std.atomic.Value(usize),
+
+    fn init(allocator: std.mem.Allocator, capacity: usize) !RedexQueue {
+        if (capacity < 2) return error.OutOfMemory;
+        const items = try allocator.alloc(RedexWorkItem, capacity);
+        return .{
+            .items = items,
+            .head = std.atomic.Value(usize).init(0),
+            .tail = std.atomic.Value(usize).init(0),
+        };
+    }
+
+    fn deinit(self: *RedexQueue, allocator: std.mem.Allocator) void {
+        allocator.free(self.items);
+    }
+
+    fn push(self: *RedexQueue, item: RedexWorkItem) bool {
+        const tail = self.tail.load(.acquire);
+        const next_tail = (tail + 1) % self.items.len;
+        if (next_tail == self.head.load(.acquire)) {
+            return false;
+        }
+        self.items[tail] = item;
+        self.tail.store(next_tail, .release);
+        return true;
+    }
+
+    fn pop(self: *RedexQueue) ?RedexWorkItem {
+        const head = self.head.load(.acquire);
+        if (head == self.tail.load(.acquire)) {
+            return null;
+        }
+        const item = self.items[head];
+        self.head.store((head + 1) % self.items.len, .release);
+        return item;
+    }
+
+    fn reset(self: *RedexQueue) void {
+        self.head.store(0, .release);
+        self.tail.store(0, .release);
+    }
+
+    fn steal(self: *RedexQueue) ?RedexWorkItem {
+        const tail = self.tail.load(.acquire);
+        const head = self.head.load(.acquire);
+        if (head == tail) {
+            return null;
+        }
+        const prev_tail = if (tail == 0) self.items.len - 1 else tail - 1;
+        const item = self.items[prev_tail];
         if (self.tail.cmpxchgStrong(tail, prev_tail, .acq_rel, .acquire)) |_| {
-            return null; // Someone else got it
+            return null;
         }
         return item;
     }
 };
 
+const WorkerContext = struct {
+    id: usize,
+    pending: *std.atomic.Value(u64),
+    inline_items: *[PAR_INLINE_STACK_SIZE]ParallelWorkItem,
+    inline_top: *usize,
+    local_interactions: *u64,
+    help_stack: []Term,
+    help_active: bool,
+};
+
+const RedexContext = struct {
+    id: usize,
+    root_loc: Val,
+    pending: *std.atomic.Value(u64),
+    inline_items: *[PAR_REDEX_INLINE_SIZE]RedexWorkItem,
+    inline_top: *usize,
+    local_interactions: *u64,
+    rescan_active: *std.atomic.Value(bool),
+    done: *std.atomic.Value(bool),
+    eval_stack: []Term,
+    gpu_enabled: bool,
+    gpu: ?*metal.MetalGPU,
+    p02_locs: []Val,
+    p02_ops: []Ext,
+    p02_lefts: []Val,
+    p02_rights: []Val,
+    p02_gpu_ops: []Term,
+    p02_gpu_nums: []Term,
+    p02_gpu_results: []Term,
+    p02_gpu_heap: []Term,
+    p02_count: *usize,
+};
+
+fn wait_table_init(allocator: std.mem.Allocator) void {
+    if (wait_keys != null and wait_vals != null) return;
+    wait_keys = allocator.alloc(std.atomic.Value(u32), PAR_WAIT_TABLE_SIZE) catch {
+        print("Error: out of memory allocating wait table\n", .{});
+        std.process.exit(1);
+    };
+    wait_vals = allocator.alloc(std.atomic.Value(u32), PAR_WAIT_TABLE_SIZE) catch {
+        print("Error: out of memory allocating wait table\n", .{});
+        std.process.exit(1);
+    };
+}
+
+fn wait_table_reset() void {
+    if (wait_keys) |keys| {
+        for (keys) |*slot| {
+            slot.store(0, .release);
+        }
+    }
+    if (wait_vals) |vals| {
+        for (vals) |*slot| {
+            slot.store(0, .release);
+        }
+    }
+}
+
+inline fn wait_hash(loc: u32) usize {
+    const hash = @as(u64, loc) * 0x9E3779B185EBCA87;
+    return @intCast(hash & (PAR_WAIT_TABLE_SIZE - 1));
+}
+
+fn waiter_register(child_loc: Val, parent_loc: Val) bool {
+    const keys = wait_keys orelse return false;
+    const vals = wait_vals orelse return false;
+
+    const child_key: u32 = @truncate(child_loc);
+    const parent_val: u32 = @truncate(parent_loc);
+    if (child_key == 0 or parent_val == 0) return false;
+
+    const mask = PAR_WAIT_TABLE_SIZE - 1;
+    const start = wait_hash(child_key);
+    var probe: usize = 0;
+    while (probe < PAR_WAIT_PROBES) : (probe += 1) {
+        const idx = (start + probe) & mask;
+        const key = keys[idx].load(.acquire);
+        if (key == child_key) {
+            vals[idx].store(parent_val, .release);
+            return true;
+        }
+        if (key == 0) {
+            if (keys[idx].cmpxchgStrong(0, child_key, .acq_rel, .acquire)) |_| {
+                continue;
+            }
+            vals[idx].store(parent_val, .release);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+fn waiter_take(child_loc: Val) ?Val {
+    const keys = wait_keys orelse return null;
+    const vals = wait_vals orelse return null;
+
+    const child_key: u32 = @truncate(child_loc);
+    if (child_key == 0) return null;
+
+    const mask = PAR_WAIT_TABLE_SIZE - 1;
+    const start = wait_hash(child_key);
+    var probe: usize = 0;
+    while (probe < PAR_WAIT_PROBES) : (probe += 1) {
+        const idx = (start + probe) & mask;
+        const key = keys[idx].load(.acquire);
+        if (key == child_key) {
+            const parent_val = vals[idx].load(.acquire);
+            if (keys[idx].cmpxchgStrong(child_key, 0, .acq_rel, .acquire)) |_| {
+                return null;
+            }
+            return parent_val;
+        }
+    }
+
+    return null;
+}
+
+fn waiter_notify(ctx: *RedexContext, child_loc: Val) void {
+    if (waiter_take(child_loc)) |parent_loc| {
+        redex_demand(ctx, parent_loc);
+    }
+}
+
+inline fn redex_is_value_tag(tag: Tag) bool {
+    if (tag == VAR or tag == APP or tag == CO0 or tag == CO1 or tag == DUP or tag == REF) return false;
+    if (tag == RED or tag == LET or tag == USE or tag == EQL or tag == MAT or tag == SWI) return false;
+    if (tag >= P00 and tag <= P15) return false;
+    if (tag == ANN or tag == BRI) return false;
+    if (tag >= F_APP and tag <= F_EQL2) return false;
+    return true;
+}
+
+inline fn redex_is_value(term: Term) bool {
+    return redex_is_value_tag(term_tag(term));
+}
+
+fn maybe_redex_at(loc: Val) ?RedexWorkItem {
+    const term_a = heap_atomic_get(loc);
+    if (is_blackhole(term_a)) return null;
+    const term_clean = term_clr_sub(term_a);
+
+    const tag_a = term_tag(term_clean);
+    const val_a = term_val(term_clean);
+
+    switch (tag_a) {
+        REF => return .{ .a = loc, .b = 0 },
+        VAR => {
+            const bound = heap_atomic_get(val_a);
+            if (is_blackhole(bound)) return null;
+            return .{ .a = loc, .b = val_a };
+        },
+        APP => {
+            const func = heap_atomic_get(val_a);
+            if (is_blackhole(func)) return null;
+            return .{ .a = loc, .b = val_a };
+        },
+        CO0, CO1 => {
+            const target = heap_atomic_get(val_a);
+            if (is_blackhole(target)) return null;
+            return .{ .a = loc, .b = val_a };
+        },
+        MAT => {
+            const scrut = heap_atomic_get(val_a);
+            if (is_blackhole(scrut)) return null;
+            return .{ .a = loc, .b = val_a };
+        },
+        SWI => {
+            const scrut = heap_atomic_get(val_a);
+            if (is_blackhole(scrut)) return null;
+            return .{ .a = loc, .b = val_a };
+        },
+        LET, USE, RED, ANN, BRI => {
+            const bound = heap_atomic_get(val_a);
+            if (is_blackhole(bound)) return null;
+            return .{ .a = loc, .b = val_a };
+        },
+        P02 => {
+            const left = heap_atomic_get(val_a);
+            const right = heap_atomic_get(val_a + 1);
+            if (is_blackhole(left) or is_blackhole(right)) return null;
+            return .{ .a = loc, .b = val_a };
+        },
+        EQL => {
+            const left = heap_atomic_get(val_a);
+            const right = heap_atomic_get(val_a + 1);
+            if (is_blackhole(left) or is_blackhole(right)) return null;
+            return .{ .a = loc, .b = val_a };
+        },
+        else => return null,
+    }
+}
+
+fn maybe_active_redex_at(loc: Val) ?RedexWorkItem {
+    const term_a = heap_atomic_get(loc);
+    if (is_blackhole(term_a)) return null;
+    const term_clean = term_clr_sub(term_a);
+
+    const tag_a = term_tag(term_clean);
+    const val_a = term_val(term_clean);
+
+    switch (tag_a) {
+        REF => return .{ .a = loc, .b = 0 },
+        VAR => {
+            const bound = heap_atomic_get(val_a);
+            if (is_blackhole(bound)) return null;
+            const clean = term_clr_sub(bound);
+            const b_tag = term_tag(clean);
+            if (b_tag == VAR or redex_is_value(clean)) {
+                return .{ .a = loc, .b = val_a };
+            }
+            return null;
+        },
+        APP => {
+            const func = heap_atomic_get(val_a);
+            if (is_blackhole(func)) return null;
+            const clean = term_clr_sub(func);
+            const tag_b = term_tag(clean);
+            if (tag_b == LAM or tag_b == SUP or tag_b == ERA) {
+                return .{ .a = loc, .b = val_a };
+            }
+            return null;
+        },
+        CO0, CO1 => {
+            const target = heap_atomic_get(val_a);
+            if (is_blackhole(target)) return null;
+            const clean = term_clr_sub(target);
+            const tag_b = term_tag(clean);
+            if (tag_b == SUP or tag_b == NUM or tag_b == ERA or tag_b == LAM or (tag_b >= C00 and tag_b <= C15)) {
+                return .{ .a = loc, .b = val_a };
+            }
+            return null;
+        },
+        MAT => {
+            const scrut = heap_atomic_get(val_a);
+            if (is_blackhole(scrut)) return null;
+            const clean = term_clr_sub(scrut);
+            const tag_b = term_tag(clean);
+            if (tag_b >= C00 and tag_b <= C15) {
+                return .{ .a = loc, .b = val_a };
+            }
+            return null;
+        },
+        SWI => {
+            const scrut = heap_atomic_get(val_a);
+            if (is_blackhole(scrut)) return null;
+            const clean = term_clr_sub(scrut);
+            if (term_tag(clean) == NUM) {
+                return .{ .a = loc, .b = val_a };
+            }
+            return null;
+        },
+        LET, USE, RED, ANN, BRI => {
+            const bound = heap_atomic_get(val_a);
+            if (is_blackhole(bound)) return null;
+            const clean = term_clr_sub(bound);
+            if (redex_is_value(clean)) {
+                return .{ .a = loc, .b = val_a };
+            }
+            return null;
+        },
+        P02 => {
+            const left = heap_atomic_get(val_a);
+            const right = heap_atomic_get(val_a + 1);
+            if (is_blackhole(left) or is_blackhole(right)) return null;
+            const left_clean = term_clr_sub(left);
+            const right_clean = term_clr_sub(right);
+            if (term_tag(left_clean) == NUM and term_tag(right_clean) == NUM) {
+                return .{ .a = loc, .b = val_a };
+            }
+            return null;
+        },
+        EQL => {
+            const left = heap_atomic_get(val_a);
+            const right = heap_atomic_get(val_a + 1);
+            if (is_blackhole(left) or is_blackhole(right)) return null;
+            const left_clean = term_clr_sub(left);
+            const right_clean = term_clr_sub(right);
+            if (redex_is_value(left_clean) and redex_is_value(right_clean)) {
+                return .{ .a = loc, .b = val_a };
+            }
+            return null;
+        },
+        else => return null,
+    }
+}
+
+const GPU_REDEX_NONE: Val = std.math.maxInt(Val);
+
+fn maybe_active_redex_at_heap(heap: []const Term, loc: Val) ?RedexWorkItem {
+    if (loc >= heap.len) return null;
+    const term_raw = heap[@intCast(loc)];
+    const term_clean = term_clr_sub(term_raw);
+
+    const tag_a = term_tag(term_clean);
+    const val_a = term_val(term_clean);
+
+    switch (tag_a) {
+        REF => return .{ .a = loc, .b = GPU_REDEX_NONE },
+        VAR => {
+            if (val_a >= heap.len) return null;
+            const bound = term_clr_sub(heap[@intCast(val_a)]);
+            const b_tag = term_tag(bound);
+            if (b_tag == VAR or redex_is_value(bound)) {
+                return .{ .a = loc, .b = val_a };
+            }
+            return null;
+        },
+        APP => {
+            if (val_a >= heap.len) return null;
+            const func = heap[@intCast(val_a)];
+            const clean = term_clr_sub(func);
+            const tag_b = term_tag(clean);
+            if (tag_b == LAM or tag_b == SUP or tag_b == ERA) {
+                return .{ .a = loc, .b = val_a };
+            }
+            return null;
+        },
+        CO0, CO1 => {
+            if (val_a >= heap.len) return null;
+            const target = heap[@intCast(val_a)];
+            const clean = term_clr_sub(target);
+            const tag_b = term_tag(clean);
+            if (tag_b == SUP or tag_b == NUM or tag_b == ERA or tag_b == LAM or tag_b == APP or (tag_b >= C00 and tag_b <= C15)) {
+                return .{ .a = loc, .b = val_a };
+            }
+            return null;
+        },
+        MAT => {
+            if (val_a >= heap.len) return null;
+            const scrut = heap[@intCast(val_a)];
+            const clean = term_clr_sub(scrut);
+            const tag_b = term_tag(clean);
+            if (tag_b >= C00 and tag_b <= C15) {
+                return .{ .a = loc, .b = val_a };
+            }
+            return null;
+        },
+        SWI => {
+            if (val_a >= heap.len) return null;
+            const scrut = heap[@intCast(val_a)];
+            const clean = term_clr_sub(scrut);
+            if (term_tag(clean) == NUM) {
+                return .{ .a = loc, .b = val_a };
+            }
+            return null;
+        },
+        LET, USE, RED, ANN, BRI => {
+            if (val_a >= heap.len) return null;
+            const bound = heap[@intCast(val_a)];
+            const clean = term_clr_sub(bound);
+            if (redex_is_value(clean)) {
+                return .{ .a = loc, .b = val_a };
+            }
+            return null;
+        },
+        P02 => {
+            if (val_a + 1 >= heap.len) return null;
+            const left = heap[@intCast(val_a)];
+            const right = heap[@intCast(val_a + 1)];
+            const left_clean = term_clr_sub(left);
+            const right_clean = term_clr_sub(right);
+            if (term_tag(left_clean) == NUM and term_tag(right_clean) == NUM) {
+                return .{ .a = loc, .b = val_a };
+            }
+            return null;
+        },
+        EQL => {
+            if (val_a + 1 >= heap.len) return null;
+            const left = heap[@intCast(val_a)];
+            const right = heap[@intCast(val_a + 1)];
+            const left_clean = term_clr_sub(left);
+            const right_clean = term_clr_sub(right);
+            if (redex_is_value(left_clean) and redex_is_value(right_clean)) {
+                return .{ .a = loc, .b = val_a };
+            }
+            return null;
+        },
+        else => return null,
+    }
+}
+
+fn scan_outermost_redexes(heap: []const Term, root_loc: Val, out: []RedexWorkItem) usize {
+    if (out.len == 0) return 0;
+    if (root_loc >= heap.len) return 0;
+
+    const scan_buf: []Val = @as([*]Val, @ptrCast(@alignCast(HVM.stack.ptr)))[0..HVM.stack.len];
+    var top: usize = 0;
+    var found: usize = 0;
+    const aggressive = true;
+
+    redex_scan_push(scan_buf, &top, root_loc);
+
+    while (top > 0 and found < out.len) {
+        top -= 1;
+        const loc = scan_buf[top];
+        if (loc >= heap.len) continue;
+        const term_raw = heap[@intCast(loc)];
+        const term = term_clr_sub(term_raw);
+
+        if (maybe_active_redex_at_heap(heap, loc)) |item| {
+            var conflict = false;
+            var i: usize = 0;
+            while (i < found) : (i += 1) {
+                const prev = out[i];
+                if (item.a == prev.a or item.a == prev.b) {
+                    conflict = true;
+                    break;
+                }
+                if (item.b != GPU_REDEX_NONE and (item.b == prev.a or item.b == prev.b)) {
+                    conflict = true;
+                    break;
+                }
+            }
+            if (!conflict) {
+                out[found] = item;
+                found += 1;
+            }
+            continue;
+        }
+
+        redex_scan_children(scan_buf, &top, term_tag(term), term_val(term), aggressive);
+    }
+
+    return found;
+}
+
+fn scan_outermost_redexes_gpu(heap: []const Term, root_loc: Val, out: []RedexWorkItem) usize {
+    if (out.len == 0) return 0;
+    if (root_loc >= heap.len) return 0;
+
+    const scan_buf: []Val = @as([*]Val, @ptrCast(@alignCast(HVM.stack.ptr)))[0..HVM.stack.len];
+    var top: usize = 0;
+    var found: usize = 0;
+    const aggressive = true;
+
+    redex_scan_push(scan_buf, &top, root_loc);
+
+    while (top > 0 and found < out.len) {
+        top -= 1;
+        const loc = scan_buf[top];
+        if (loc >= heap.len) continue;
+        const term_raw = heap[@intCast(loc)];
+        const term = term_clr_sub(term_raw);
+
+        if (maybe_active_redex_at_heap(heap, loc)) |item| {
+            var conflict = false;
+            var i: usize = 0;
+            while (i < found) : (i += 1) {
+                const prev = out[i];
+                if (item.a == prev.a or item.a == prev.b) {
+                    conflict = true;
+                    break;
+                }
+                if (item.b != GPU_REDEX_NONE and (item.b == prev.a or item.b == prev.b)) {
+                    conflict = true;
+                    break;
+                }
+            }
+            if (!conflict) {
+                out[found] = item;
+                found += 1;
+            }
+            continue;
+        }
+
+        redex_scan_children_gpu(scan_buf, &top, term_tag(term), term_val(term), aggressive);
+    }
+
+    return found;
+}
+
+
+fn redex_enqueue(ctx: *RedexContext, item: RedexWorkItem) void {
+    _ = ctx.pending.fetchAdd(1, .acq_rel);
+    _ = parallel_spawns.fetchAdd(1, .acq_rel);
+
+    if (ctx.inline_top.* < ctx.inline_items.len) {
+        ctx.inline_items[ctx.inline_top.*] = item;
+        ctx.inline_top.* += 1;
+        return;
+    }
+
+    while (!redex_queues[ctx.id].push(item)) {
+        std.Thread.yield() catch {};
+    }
+}
+
+fn redex_enqueue_if_active(ctx: *RedexContext, loc: Val) void {
+    if (maybe_active_redex_at(loc)) |item| {
+        redex_enqueue(ctx, item);
+    }
+}
+
+fn redex_demand(ctx: *RedexContext, loc: Val) void {
+    if (maybe_redex_at(loc)) |item| {
+        redex_enqueue(ctx, item);
+    }
+}
+
+fn force_whnf(ctx: *RedexContext, loc: Val) void {
+    const cur = heap_atomic_get(loc);
+    if (is_blackhole(cur)) return;
+    if (!heap_atomic_cas(loc, cur, make_blackhole(loc, @intCast(ctx.id)))) return;
+    const result = reduce_parallel_atomic(term_clr_sub(cur), ctx.eval_stack, ctx.local_interactions, null);
+    heap_atomic_set(loc, result);
+    waiter_notify(ctx, loc);
+}
+
+fn redex_demand_or_force(ctx: *RedexContext, loc: Val) void {
+    if (ctx.pending.load(.acquire) < PAR_DEMAND_PENDING_MAX) {
+        redex_demand(ctx, loc);
+    } else {
+        force_whnf(ctx, loc);
+    }
+}
+
+fn redex_wait_or_force(ctx: *RedexContext, child_loc: Val, parent_loc: Val) bool {
+    const registered = waiter_register(child_loc, parent_loc);
+    redex_demand_or_force(ctx, child_loc);
+    return !registered;
+}
+
+fn redex_take_item(ctx: *RedexContext) ?RedexWorkItem {
+    if (ctx.inline_top.* > 0) {
+        ctx.inline_top.* -= 1;
+        return ctx.inline_items[ctx.inline_top.*];
+    }
+
+    if (redex_queues[ctx.id].pop()) |item| {
+        return item;
+    }
+
+    var stolen: ?RedexWorkItem = null;
+    var i: usize = 0;
+    while (i < num_workers and stolen == null) : (i += 1) {
+        if (i == ctx.id) continue;
+        stolen = redex_queues[i].steal();
+    }
+
+    return stolen;
+}
+
+fn p02_batch_flush(ctx: *RedexContext, force: bool) void {
+    const count = ctx.p02_count.*;
+    if (count == 0) return;
+    if (!force and count < PAR_P02_GPU_MIN) return;
+
+    var gpu_failed = false;
+    if (ctx.gpu_enabled and ctx.gpu != null and count >= PAR_P02_GPU_MIN) {
+        if (p02_gpu_lock.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) {
+            defer p02_gpu_lock.store(false, .release);
+            if (ctx.gpu) |gpu| {
+                for (0..count) |i| {
+                    ctx.p02_gpu_ops[i] = term_new(P02, ctx.p02_ops[i], @intCast(i));
+                    ctx.p02_gpu_nums[i] = term_new(NUM, 0, ctx.p02_lefts[i]);
+                    ctx.p02_gpu_heap[i] = term_new(NUM, 0, ctx.p02_rights[i]);
+                }
+                gpu.gpuInteractOp2Num(
+                    ctx.p02_gpu_ops[0..count],
+                    ctx.p02_gpu_nums[0..count],
+                    ctx.p02_gpu_results[0..count],
+                    ctx.p02_gpu_heap[0..count],
+                ) catch {
+                    gpu_failed = true;
+                };
+            } else {
+                gpu_failed = true;
+            }
+
+            if (!gpu_failed) {
+                for (0..count) |i| {
+                    const loc = ctx.p02_locs[i];
+                    heap_atomic_set(loc, ctx.p02_gpu_results[i]);
+                    waiter_notify(ctx, loc);
+                    _ = ctx.pending.fetchSub(1, .acq_rel);
+                }
+                ctx.p02_count.* = 0;
+                return;
+            }
+        } else if (!force) {
+            return;
+        }
+    }
+
+    for (0..count) |i| {
+        const loc = ctx.p02_locs[i];
+        const op = ctx.p02_ops[i];
+        const left = ctx.p02_lefts[i];
+        const right = ctx.p02_rights[i];
+        const result = term_new(NUM, 0, compute_op(op, left, right));
+        heap_atomic_set(loc, result);
+        waiter_notify(ctx, loc);
+        _ = ctx.pending.fetchSub(1, .acq_rel);
+    }
+    ctx.p02_count.* = 0;
+}
+
+fn p02_batch_enqueue(ctx: *RedexContext, loc: Val, op: Ext, left: Val, right: Val) bool {
+    if (!ctx.gpu_enabled) return false;
+    if (ctx.p02_locs.len == 0) return false;
+
+    var idx = ctx.p02_count.*;
+    if (idx >= ctx.p02_locs.len) {
+        p02_batch_flush(ctx, true);
+        idx = ctx.p02_count.*;
+        if (idx >= ctx.p02_locs.len) return false;
+    }
+
+    ctx.p02_locs[idx] = loc;
+    ctx.p02_ops[idx] = op;
+    ctx.p02_lefts[idx] = left;
+    ctx.p02_rights[idx] = right;
+    ctx.p02_count.* = idx + 1;
+
+    if (ctx.p02_count.* >= PAR_P02_GPU_MIN) {
+        p02_batch_flush(ctx, false);
+    }
+
+    if (ctx.p02_count.* >= PAR_P02_BATCH_CAP) {
+        p02_batch_flush(ctx, true);
+    }
+
+    return true;
+}
+
+fn reduce_redex(ctx: *RedexContext, item: RedexWorkItem) bool {
+    const loc_a = item.a;
+    const term_a = heap_atomic_get(loc_a);
+    if (is_blackhole(term_a)) return false;
+    const term_clean = term_clr_sub(term_a);
+
+    if (!heap_atomic_cas(loc_a, term_a, make_blackhole(loc_a, @intCast(ctx.id)))) return false;
+
+    var result_opt: ?Term = null;
+    var offloaded = false;
+    var retry_after: bool = false;
+    const tag_a = term_tag(term_clean);
+    const ext_a = term_ext(term_clean);
+    const val_a = term_val(term_clean);
+
+    switch (tag_a) {
+        REF => {
+            if (HVM.book[ext_a]) |func| {
+                result_opt = func(term_clean);
+                ctx.local_interactions.* += 1;
+            } else {
+                print("undefined function: {d}\n", .{ext_a});
+                std.process.exit(1);
+            }
+        },
+        VAR => blk: {
+            const bound = heap_atomic_get(val_a);
+            if (is_blackhole(bound)) break :blk;
+            const clean = term_clr_sub(bound);
+            if (redex_is_value(clean)) {
+                heap_atomic_set(val_a, term_set_sub(clean));
+                result_opt = clean;
+            } else {
+                retry_after = redex_wait_or_force(ctx, val_a, loc_a);
+            }
+        },
+        APP => blk: {
+            const app_loc = val_a;
+            const func_term = heap_atomic_get(app_loc);
+            if (is_blackhole(func_term)) break :blk;
+            const func_clean = term_clr_sub(func_term);
+            const func_tag = term_tag(func_clean);
+            if (func_tag == LAM) {
+                ctx.local_interactions.* += 1;
+                heap_atomic_set(app_loc, func_clean);
+                const arg = heap_atomic_get(app_loc + 1);
+                const lam_loc = term_val(func_clean);
+                const bod = heap_atomic_get(lam_loc);
+                heap_atomic_set(lam_loc, term_set_sub(arg));
+                result_opt = bod;
+            } else if (func_tag == ERA) {
+                ctx.local_interactions.* += 1;
+                result_opt = term_new(ERA, 0, 0);
+            } else if (func_tag == SUP) {
+                ctx.local_interactions.* += 1;
+                const sup_loc = term_val(func_clean);
+                const sup_lab = term_ext(func_clean);
+                const arg = heap_atomic_get(app_loc + 1);
+                const lft = heap_atomic_get(sup_loc);
+                const rgt = heap_atomic_get(sup_loc + 1);
+
+                const base_loc: Val = alloc(7);
+                const dup_loc: Val = base_loc;
+                const app0_loc: Val = base_loc + 1;
+                const app1_loc: Val = base_loc + 3;
+                const res_loc: Val = base_loc + 5;
+
+                heap_atomic_set(dup_loc, arg);
+                heap_atomic_set(app0_loc, lft);
+                heap_atomic_set(app0_loc + 1, term_new(CO0, sup_lab, dup_loc));
+                heap_atomic_set(app1_loc, rgt);
+                heap_atomic_set(app1_loc + 1, term_new(CO1, sup_lab, dup_loc));
+                heap_atomic_set(res_loc, term_new(APP, 0, app0_loc));
+                heap_atomic_set(res_loc + 1, term_new(APP, 0, app1_loc));
+
+                result_opt = term_new(SUP, sup_lab, res_loc);
+            } else {
+                retry_after = redex_wait_or_force(ctx, app_loc, loc_a);
+            }
+        },
+        CO0, CO1 => blk: {
+            const dup_loc = val_a;
+            const target = heap_atomic_get(dup_loc);
+            if (is_blackhole(target)) break :blk;
+            const clean = term_clr_sub(target);
+            const tag_b = term_tag(clean);
+
+            if (tag_b == SUP) {
+                ctx.local_interactions.* += 1;
+                const sup_loc = term_val(clean);
+                const sup_lab = term_ext(clean);
+                const dup_lab = ext_a;
+
+                if (dup_lab == sup_lab) {
+                    const lft = heap_atomic_get(sup_loc);
+                    const rgt = heap_atomic_get(sup_loc + 1);
+                    if (tag_a == CO0) {
+                        heap_atomic_set(dup_loc, term_set_sub(rgt));
+                        result_opt = lft;
+                    } else {
+                        heap_atomic_set(dup_loc, term_set_sub(lft));
+                        result_opt = rgt;
+                    }
+                } else {
+                    commutation_count += 1;
+                    const new_loc: Val = alloc(4);
+                    heap_atomic_set(new_loc, term_new(CO0, dup_lab, sup_loc));
+                    heap_atomic_set(new_loc + 1, term_new(CO0, dup_lab, sup_loc + 1));
+                    heap_atomic_set(new_loc + 2, term_new(CO1, dup_lab, sup_loc));
+                    heap_atomic_set(new_loc + 3, term_new(CO1, dup_lab, sup_loc + 1));
+
+                    if (tag_a == CO0) {
+                        heap_atomic_set(dup_loc, term_set_sub(term_new(SUP, sup_lab, new_loc + 2)));
+                        result_opt = term_new(SUP, sup_lab, new_loc);
+                    } else {
+                        heap_atomic_set(dup_loc, term_set_sub(term_new(SUP, sup_lab, new_loc)));
+                        result_opt = term_new(SUP, sup_lab, new_loc + 2);
+                    }
+                }
+            } else if (tag_b == NUM) {
+                ctx.local_interactions.* += 1;
+                heap_atomic_set(dup_loc, term_set_sub(clean));
+                result_opt = clean;
+            } else if (tag_b == ERA) {
+                ctx.local_interactions.* += 1;
+                const era = term_new(ERA, 0, 0);
+                heap_atomic_set(dup_loc, term_set_sub(era));
+                result_opt = era;
+            } else if (tag_b == LAM) {
+                ctx.local_interactions.* += 1;
+                const dup_lab = ext_a;
+                const lam_loc = term_val(clean);
+                const bod = heap_atomic_get(lam_loc);
+
+                const base_loc: Val = alloc(3);
+                const inner_dup: Val = base_loc;
+                const lam0_loc: Val = base_loc + 1;
+                const lam1_loc: Val = base_loc + 2;
+
+                heap_atomic_set(inner_dup, bod);
+                heap_atomic_set(lam0_loc, term_new(CO0, dup_lab, inner_dup));
+                heap_atomic_set(lam1_loc, term_new(CO1, dup_lab, inner_dup));
+
+                if (tag_a == CO0) {
+                    heap_atomic_set(dup_loc, term_set_sub(term_new(LAM, 0, lam1_loc)));
+                    result_opt = term_new(LAM, 0, lam0_loc);
+                } else {
+                    heap_atomic_set(dup_loc, term_set_sub(term_new(LAM, 0, lam0_loc)));
+                    result_opt = term_new(LAM, 0, lam1_loc);
+                }
+            } else if (tag_b >= C00 and tag_b <= C15) {
+                ctx.local_interactions.* += 1;
+                const dup_lab = ext_a;
+                const ctr_loc = term_val(clean);
+                const ctr_ext = term_ext(clean);
+                const arity = ctr_arity(tag_b);
+
+                if (arity == 0) {
+                    heap_atomic_set(dup_loc, term_set_sub(clean));
+                    result_opt = clean;
+                } else {
+                    const needed = 3 * arity;
+                    const base_loc: Val = alloc(@as(u64, needed));
+                    const arity_val: Val = @intCast(arity);
+
+                    for (0..arity) |i| {
+                        const idx: Val = @intCast(i);
+                        heap_atomic_set(base_loc + idx, heap_atomic_get(ctr_loc + idx));
+                    }
+
+                    const ctr0_base: Val = base_loc + arity_val;
+                    const ctr1_base: Val = base_loc + arity_val * 2;
+
+                    for (0..arity) |i| {
+                        const idx: Val = @intCast(i);
+                        heap_atomic_set(ctr0_base + idx, term_new(CO0, dup_lab, base_loc + idx));
+                        heap_atomic_set(ctr1_base + idx, term_new(CO1, dup_lab, base_loc + idx));
+                    }
+
+                    if (tag_a == CO0) {
+                        heap_atomic_set(dup_loc, term_set_sub(term_new(tag_b, ctr_ext, ctr1_base)));
+                        result_opt = term_new(tag_b, ctr_ext, ctr0_base);
+                    } else {
+                        heap_atomic_set(dup_loc, term_set_sub(term_new(tag_b, ctr_ext, ctr0_base)));
+                        result_opt = term_new(tag_b, ctr_ext, ctr1_base);
+                    }
+                }
+            } else {
+                retry_after = redex_wait_or_force(ctx, dup_loc, loc_a);
+            }
+        },
+        MAT => blk: {
+            const mat_loc = val_a;
+            const scrut = heap_atomic_get(mat_loc);
+            if (is_blackhole(scrut)) break :blk;
+            const clean = term_clr_sub(scrut);
+            const tag_b = term_tag(clean);
+            if (tag_b >= C00 and tag_b <= C15) {
+                ctx.local_interactions.* += 1;
+                const ctr_loc = term_val(clean);
+                const case_idx = term_ext(clean);
+                const arity = ctr_arity(tag_b);
+
+                var branch = heap_atomic_get(mat_loc + 1 + case_idx);
+                for (0..arity) |i| {
+                    const field = heap_atomic_get(ctr_loc + i);
+                    const loc: Val = alloc(2);
+                    heap_atomic_set(loc, branch);
+                    heap_atomic_set(loc + 1, field);
+                    branch = term_new(APP, 0, loc);
+                }
+                result_opt = branch;
+            } else {
+                retry_after = redex_wait_or_force(ctx, mat_loc, loc_a);
+            }
+        },
+        SWI => blk: {
+            const swi_loc = val_a;
+            const scrut = heap_atomic_get(swi_loc);
+            if (is_blackhole(scrut)) break :blk;
+            const clean = term_clr_sub(scrut);
+            if (term_tag(clean) == NUM) {
+                ctx.local_interactions.* += 1;
+                const num_val = term_val(clean);
+                if (num_val == 0) {
+                    result_opt = heap_atomic_get(swi_loc + 1);
+                } else {
+                    const succ = heap_atomic_get(swi_loc + 2);
+                    const loc: Val = alloc(2);
+                    heap_atomic_set(loc, succ);
+                    heap_atomic_set(loc + 1, term_new(NUM, 0, num_val - 1));
+                    result_opt = term_new(APP, 0, loc);
+                }
+            } else {
+                retry_after = redex_wait_or_force(ctx, swi_loc, loc_a);
+            }
+        },
+        LET => blk: {
+            const let_loc = val_a;
+            const bound = heap_atomic_get(let_loc);
+            if (is_blackhole(bound)) break :blk;
+            const clean = term_clr_sub(bound);
+            if (redex_is_value(clean)) {
+                ctx.local_interactions.* += 1;
+                const bod = heap_atomic_get(let_loc + 1);
+                heap_atomic_set(let_loc, term_set_sub(clean));
+                result_opt = bod;
+            } else {
+                retry_after = redex_wait_or_force(ctx, let_loc, loc_a);
+            }
+        },
+        USE => blk: {
+            const use_loc = val_a;
+            const bound = heap_atomic_get(use_loc);
+            if (is_blackhole(bound)) break :blk;
+            const clean = term_clr_sub(bound);
+            if (redex_is_value(clean)) {
+                heap_atomic_set(use_loc, clean);
+                result_opt = clean;
+            } else {
+                retry_after = redex_wait_or_force(ctx, use_loc, loc_a);
+            }
+        },
+        RED => blk: {
+            const red_loc = val_a;
+            const bound = heap_atomic_get(red_loc);
+            if (is_blackhole(bound)) break :blk;
+            const clean = term_clr_sub(bound);
+            if (redex_is_value(clean)) {
+                result_opt = clean;
+            } else {
+                retry_after = redex_wait_or_force(ctx, red_loc, loc_a);
+            }
+        },
+        ANN => blk: {
+            const ann_loc = val_a;
+            const term_raw = heap_atomic_get(ann_loc);
+            if (is_blackhole(term_raw)) break :blk;
+            const ann_term_clean = term_clr_sub(term_raw);
+            if (!redex_is_value(ann_term_clean)) {
+                retry_after = redex_wait_or_force(ctx, ann_loc, loc_a);
+                break :blk;
+            }
+
+            ctx.local_interactions.* += 1;
+            const term_tag_clean = term_tag(ann_term_clean);
+            const term_ext_clean = term_ext(ann_term_clean);
+            const term_val_clean = term_val(ann_term_clean);
+            const typ = heap_atomic_get(ann_loc + 1);
+            const typ_tag = term_tag(typ);
+
+            if (term_tag_clean == SUP) {
+                const sup_loc = term_val_clean;
+                const sup_ext = term_ext_clean;
+
+                const loc0 = alloc(2);
+                heap_atomic_set(loc0, heap_atomic_get(sup_loc));
+                heap_atomic_set(loc0 + 1, typ);
+
+                const loc1 = alloc(2);
+                heap_atomic_set(loc1, heap_atomic_get(sup_loc + 1));
+                heap_atomic_set(loc1 + 1, typ);
+
+                const new_loc = alloc(2);
+                heap_atomic_set(new_loc, term_new(ANN, 0, @truncate(loc0)));
+                heap_atomic_set(new_loc + 1, term_new(ANN, 0, @truncate(loc1)));
+
+                result_opt = term_new(SUP, sup_ext, @truncate(new_loc));
+            } else if (term_tag_clean == LAM and typ_tag == ALL) {
+                const typ_val = term_val(typ);
+                _ = heap_atomic_get(typ_val);
+                const codomain_lam = heap_atomic_get(typ_val + 1);
+
+                if (term_tag(codomain_lam) == LAM) {
+                    const codomain_loc = term_val(codomain_lam);
+                    const codomain = heap_atomic_get(codomain_loc);
+
+                    const lam_body = heap_atomic_get(term_val_clean);
+                    const ann_body_loc = alloc(2);
+                    heap_atomic_set(ann_body_loc, lam_body);
+                    heap_atomic_set(ann_body_loc + 1, codomain);
+
+                    const new_lam_loc = alloc(1);
+                    heap_atomic_set(new_lam_loc, term_new(ANN, 0, @truncate(ann_body_loc)));
+                    result_opt = term_new(LAM, term_ext_clean, @truncate(new_lam_loc));
+                } else {
+                    result_opt = ann_term_clean;
+                }
+            } else if (term_tag_clean >= C00 and term_tag_clean <= C15 and typ_tag == SIG) {
+                const arity = ctr_arity(term_tag_clean);
+                if (arity >= 2) {
+                    const typ_val = term_val(typ);
+                    const fst_type = heap_atomic_get(typ_val);
+                    const snd_type_lam = heap_atomic_get(typ_val + 1);
+
+                    const fst_elem = heap_atomic_get(term_val_clean);
+
+                    const ann_fst_loc = alloc(2);
+                    heap_atomic_set(ann_fst_loc, fst_elem);
+                    heap_atomic_set(ann_fst_loc + 1, fst_type);
+                    const ann_fst = term_new(ANN, 0, @truncate(ann_fst_loc));
+
+                    if (term_tag(snd_type_lam) == LAM) {
+                        const snd_elem = heap_atomic_get(term_val_clean + 1);
+                        const snd_type_loc = term_val(snd_type_lam);
+                        const snd_type_body = heap_atomic_get(snd_type_loc);
+
+                        const ann_snd_loc = alloc(2);
+                        heap_atomic_set(ann_snd_loc, snd_elem);
+                        heap_atomic_set(ann_snd_loc + 1, snd_type_body);
+
+                        const new_ctr_loc = alloc(arity);
+                        heap_atomic_set(new_ctr_loc, ann_fst);
+                        heap_atomic_set(new_ctr_loc + 1, term_new(ANN, 0, @truncate(ann_snd_loc)));
+                        for (2..arity) |i| {
+                            heap_atomic_set(new_ctr_loc + i, heap_atomic_get(term_val_clean + i));
+                        }
+                        result_opt = term_new(term_tag_clean, term_ext_clean, @truncate(new_ctr_loc));
+                    } else {
+                        result_opt = ann_term_clean;
+                    }
+                } else {
+                    result_opt = ann_term_clean;
+                }
+            } else if (term_tag_clean == NUM or term_tag_clean == TYP) {
+                result_opt = ann_term_clean;
+            } else {
+                result_opt = ann_term_clean;
+            }
+        },
+        BRI => blk: {
+            const bri_loc = val_a;
+            const body = heap_atomic_get(bri_loc);
+            if (is_blackhole(body)) break :blk;
+            const clean = term_clr_sub(body);
+            if (redex_is_value(clean)) {
+                ctx.local_interactions.* += 1;
+                result_opt = clean;
+            } else {
+                retry_after = redex_wait_or_force(ctx, bri_loc, loc_a);
+            }
+        },
+        P02 => blk: {
+            const op_loc = val_a;
+            const left = heap_atomic_get(op_loc);
+            const right = heap_atomic_get(op_loc + 1);
+            if (is_blackhole(left) or is_blackhole(right)) break :blk;
+            const left_clean = term_clr_sub(left);
+            const right_clean = term_clr_sub(right);
+            const left_tag = term_tag(left_clean);
+            const right_tag = term_tag(right_clean);
+            if (left_tag == NUM and right_tag == NUM) {
+                ctx.local_interactions.* += 1;
+                const x = term_val(left_clean);
+                const y = term_val(right_clean);
+                if (p02_batch_enqueue(ctx, loc_a, ext_a, x, y)) {
+                    offloaded = true;
+                } else {
+                    result_opt = term_new(NUM, 0, compute_op(ext_a, x, y));
+                }
+            } else {
+                if (left_tag != NUM) retry_after = redex_wait_or_force(ctx, op_loc, loc_a);
+                if (right_tag != NUM) retry_after = redex_wait_or_force(ctx, op_loc + 1, loc_a) or retry_after;
+            }
+        },
+        EQL => blk: {
+            const eql_loc = val_a;
+            const left = heap_atomic_get(eql_loc);
+            const right = heap_atomic_get(eql_loc + 1);
+            if (is_blackhole(left) or is_blackhole(right)) break :blk;
+            const left_clean = term_clr_sub(left);
+            const right_clean = term_clr_sub(right);
+            const left_is_val = redex_is_value(left_clean);
+            const right_is_val = redex_is_value(right_clean);
+            if (left_is_val and right_is_val) {
+                ctx.local_interactions.* += 1;
+                const equal = struct_equal_parallel(left_clean, right_clean, ctx.eval_stack, ctx.local_interactions, null);
+                result_opt = term_new(NUM, 0, if (equal) 1 else 0);
+            } else {
+                if (!left_is_val) retry_after = redex_wait_or_force(ctx, eql_loc, loc_a);
+                if (!right_is_val) retry_after = redex_wait_or_force(ctx, eql_loc + 1, loc_a) or retry_after;
+            }
+        },
+        else => {},
+    }
+
+    const aggressive = ctx.pending.load(.acquire) < PAR_SCAN_AGGRESSIVE_PENDING_MAX;
+    if (offloaded) {
+        return true;
+    }
+
+    if (result_opt) |result| {
+        heap_atomic_set(loc_a, result);
+        waiter_notify(ctx, loc_a);
+        if (aggressive) {
+            redex_demand(ctx, loc_a);
+        } else {
+            redex_enqueue_if_active(ctx, loc_a);
+        }
+        if (aggressive and ctx.pending.load(.acquire) < PAR_LOCAL_SCAN_PENDING_MAX) {
+            redex_scan_local(ctx, loc_a, PAR_LOCAL_SCAN_MAX_NODES);
+        }
+    } else {
+        heap_atomic_set(loc_a, term_a);
+        if (retry_after) {
+            redex_demand(ctx, loc_a);
+        }
+    }
+
+    return false;
+}
+
+fn redex_scan_push(buf: []Val, top: *usize, loc: Val) void {
+    if (top.* >= buf.len) {
+        print("Error: redex scan stack overflow\n", .{});
+        std.process.exit(1);
+    }
+    buf[top.*] = loc;
+    top.* += 1;
+}
+
+fn redex_scan_children(buf: []Val, top: *usize, tag: Tag, val: Val, aggressive: bool) void {
+    switch (tag) {
+        VAR, CO0, CO1, MAT, SWI, USE, LET, ANN, BRI, RED => {
+            redex_scan_push(buf, top, val);
+        },
+        APP => {
+            redex_scan_push(buf, top, val);
+            if (aggressive) {
+                redex_scan_push(buf, top, val + 1);
+            }
+        },
+        P02, EQL => {
+            redex_scan_push(buf, top, val);
+            redex_scan_push(buf, top, val + 1);
+        },
+        SUP => {},
+        LAM => {},
+        C00, C01, C02, C03, C04, C05, C06, C07,
+        C08, C09, C10, C11, C12, C13, C14, C15 => {},
+        else => {},
+    }
+}
+
+fn redex_scan_children_gpu(buf: []Val, top: *usize, tag: Tag, val: Val, aggressive: bool) void {
+    switch (tag) {
+        VAR, CO0, CO1, MAT, SWI, USE, LET, ANN, BRI, RED => {
+            redex_scan_push(buf, top, val);
+        },
+        APP => {
+            redex_scan_push(buf, top, val);
+            if (aggressive) {
+                redex_scan_push(buf, top, val + 1);
+            }
+        },
+        P02, EQL => {
+            redex_scan_push(buf, top, val);
+            redex_scan_push(buf, top, val + 1);
+        },
+        SUP => {
+            redex_scan_push(buf, top, val);
+            redex_scan_push(buf, top, val + 1);
+        },
+        LAM => {},
+        C00, C01, C02, C03, C04, C05, C06, C07,
+        C08, C09, C10, C11, C12, C13, C14, C15 => {
+            const arity = tag - C00;
+            var i: Tag = 0;
+            while (i < arity) : (i += 1) {
+                redex_scan_push(buf, top, val + i);
+            }
+        },
+        else => {},
+    }
+}
+
+fn redex_scan_demanded(ctx: *RedexContext) u64 {
+    const scan_buf: []Val = @as([*]Val, @ptrCast(@alignCast(ctx.eval_stack.ptr)))[0..ctx.eval_stack.len];
+    var top: usize = 0;
+    var found: u64 = 0;
+    const aggressive = ctx.pending.load(.acquire) < PAR_SCAN_AGGRESSIVE_PENDING_MAX;
+
+    redex_scan_push(scan_buf, &top, ctx.root_loc);
+
+    while (top > 0) {
+        top -= 1;
+        const loc = scan_buf[top];
+        const term_raw = heap_atomic_get(loc);
+        if (is_blackhole(term_raw)) continue;
+        const term = term_clr_sub(term_raw);
+
+        if (maybe_redex_at(loc)) |item| {
+            redex_enqueue(ctx, item);
+            found += 1;
+        }
+
+        const tag = term_tag(term);
+        const val = term_val(term);
+        redex_scan_children(scan_buf, &top, tag, val, aggressive);
+    }
+
+    return found;
+}
+
+fn redex_scan_local(ctx: *RedexContext, root_loc: Val, max_nodes: usize) void {
+    if (max_nodes == 0) return;
+    const scan_buf: []Val = @as([*]Val, @ptrCast(@alignCast(ctx.eval_stack.ptr)))[0..ctx.eval_stack.len];
+    var top: usize = 0;
+    var seen: usize = 0;
+
+    const root_raw = heap_atomic_get(root_loc);
+    if (is_blackhole(root_raw)) return;
+    const root = term_clr_sub(root_raw);
+    redex_scan_children(scan_buf, &top, term_tag(root), term_val(root), true);
+
+    while (top > 0 and seen < max_nodes) {
+        top -= 1;
+        const loc = scan_buf[top];
+        const term_raw = heap_atomic_get(loc);
+        if (is_blackhole(term_raw)) continue;
+        const term = term_clr_sub(term_raw);
+
+        if (maybe_redex_at(loc)) |item| {
+            redex_enqueue(ctx, item);
+        }
+
+        seen += 1;
+        redex_scan_children(scan_buf, &top, term_tag(term), term_val(term), true);
+    }
+}
+
+fn redex_worker_loop(ctx: *RedexContext) void {
+    var gc_epoch: u64 = parallel_gc_epoch.load(.acquire);
+    while (true) {
+        parallel_gc_poll(ctx, &gc_epoch);
+        if (redex_take_item(ctx)) |item| {
+            const offloaded = reduce_redex(ctx, item);
+            if (!offloaded) {
+                _ = ctx.pending.fetchSub(1, .acq_rel);
+            }
+            continue;
+        }
+
+        if (ctx.p02_count.* > 0) {
+            p02_batch_flush(ctx, true);
+        }
+
+        if (ctx.done.load(.acquire)) {
+            p02_batch_flush(ctx, true);
+            break;
+        }
+
+        if (ctx.pending.load(.acquire) == 0) {
+            if (ctx.rescan_active.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) {
+                if (ctx.pending.load(.acquire) == 0 and !ctx.done.load(.acquire)) {
+                    const found = redex_scan_demanded(ctx);
+                    if (found == 0) {
+                        ctx.done.store(true, .release);
+                    }
+                }
+                ctx.rescan_active.store(false, .release);
+            }
+        }
+
+        std.Thread.yield() catch {};
+    }
+}
+
+fn parallel_take_item(ctx: *WorkerContext) ?ParallelWorkItem {
+    var item_opt: ?ParallelWorkItem = null;
+    if (ctx.inline_top.* > 0) {
+        ctx.inline_top.* -= 1;
+        item_opt = ctx.inline_items[ctx.inline_top.*];
+    } else {
+        if (work_queues[ctx.id].pop()) |item| {
+            item_opt = item;
+        } else {
+            var stolen: ?ParallelWorkItem = null;
+            var i: usize = 0;
+            while (i < num_workers and stolen == null) : (i += 1) {
+                if (i == ctx.id) continue;
+                stolen = work_queues[i].steal();
+            }
+            item_opt = stolen;
+        }
+    }
+
+    if (item_opt) |_| {
+        _ = ctx.pending.fetchSub(1, .acq_rel);
+    }
+
+    return item_opt;
+}
+
+fn parallel_run_item(ctx: *WorkerContext, item: ParallelWorkItem, stack: []Term) void {
+    if (item.is_heap) {
+        const owner: u8 = @intCast(ctx.id);
+        const claimed = make_blackhole(item.heap_loc, owner);
+        const cur = atomic_load_term(item.result_slot);
+        if (cur == item.term) {
+            if (!atomic_cas_term(item.result_slot, item.term, claimed)) return;
+        } else if (is_blackhole(cur) and term_val(cur) == item.heap_loc) {
+            // Already claimed by another worker; proceed with reduction.
+        } else {
+            return;
+        }
+    }
+
+    const result = reduce_parallel_atomic(item.term, stack, ctx.local_interactions, ctx);
+    atomic_store_term(item.result_slot, result);
+    schedule_parallel_children(ctx.id, ctx.pending, ctx.inline_items, ctx.inline_top, item.spawn_depth, result);
+}
+
+fn parallel_help(ctx: *WorkerContext) void {
+    if (ctx.help_active) {
+        std.Thread.yield() catch {};
+        return;
+    }
+    ctx.help_active = true;
+    defer ctx.help_active = false;
+
+    if (parallel_take_item(ctx)) |item| {
+        parallel_run_item(ctx, item, ctx.help_stack);
+    } else {
+        std.Thread.yield() catch {};
+    }
+}
+
+fn wait_for_slot(ctx: ?*WorkerContext, loc: Val) Term {
+    var cur = heap_atomic_get(loc);
+    while (is_blackhole(cur)) {
+        if (ctx) |c| {
+            parallel_help(c);
+        } else {
+            std.Thread.yield() catch {};
+        }
+        cur = heap_atomic_get(loc);
+    }
+    return cur;
+}
+
 /// Global work queues for each worker
 var work_queues: [MAX_WORKERS]WorkQueue = undefined;
+var redex_queues: [MAX_WORKERS]RedexQueue = undefined;
 var parallel_reduction_active: bool = false;
 
 /// Initialize parallel reduction system
@@ -2632,6 +5037,1261 @@ pub fn parallel_reduce_batch(terms: []Term, results: []Term) void {
     }
 }
 
+fn reduce_parallel_atomic(term: Term, stack: []Term, interactions: *u64, ctx: ?*WorkerContext) Term {
+    var next = term;
+    var spos: usize = 0;
+    var local_interactions: u64 = 0;
+    defer interactions.* += local_interactions;
+    const owner: u8 = if (ctx) |c| @intCast(c.id) else 0;
+
+    while (true) {
+        if ((next & SUB_BIT) != 0) {
+            next &= ~SUB_BIT;
+            continue;
+        }
+
+        if (is_blackhole(next)) {
+            const loc = term_val(next);
+            next = wait_for_slot(ctx, loc);
+            continue;
+        }
+
+        const tag = term_tag(next);
+        const ext = term_ext(next);
+        const val = term_val(next);
+
+        switch (tag) {
+            VAR => {
+                while (true) {
+                    const cell = heap_atomic_get(val);
+                    if ((cell & SUB_BIT) != 0) {
+                        next = cell & ~SUB_BIT;
+                        break;
+                    }
+                    if (is_blackhole(cell)) {
+                        next = wait_for_slot(ctx, val);
+                        break;
+                    }
+                    if (heap_atomic_cas(val, cell, make_blackhole(val, owner))) {
+                        stack[spos] = term_new(VAR, 0, val);
+                        spos += 1;
+                        next = cell;
+                        break;
+                    }
+                }
+                continue;
+            },
+
+            CO0, CO1 => {
+                while (true) {
+                    const dup_val = heap_atomic_get(val);
+                    if ((dup_val & SUB_BIT) != 0) {
+                        next = dup_val & ~SUB_BIT;
+                        break;
+                    }
+                    if (is_blackhole(dup_val)) {
+                        next = wait_for_slot(ctx, val);
+                        break;
+                    }
+                    if (heap_atomic_cas(val, dup_val, make_blackhole(val, owner))) {
+                        stack[spos] = next;
+                        spos += 1;
+                        next = dup_val;
+                        break;
+                    }
+                }
+                continue;
+            },
+
+            REF => {
+                if (HVM.book[ext]) |func| {
+                    next = func(next);
+                    local_interactions += 1;
+                    continue;
+                }
+                print("undefined function: {d}\n", .{ext});
+                std.process.exit(1);
+            },
+
+            APP, MAT, SWI, USE, LET => {
+                if (tag == LET and PAR_SPAWN_LET and spos < PAR_LET_SPAWN_SPOS_MAX) {
+                    if (ctx) |c| {
+                        if (num_workers > 1 and c.pending.load(.acquire) < PAR_SPAWN_PENDING_MAX) {
+                            const body_loc = val + 1;
+                            const body_term = heap_atomic_get(body_loc);
+                            const clean = body_term & ~SUB_BIT;
+                            if (!term_is_val(clean) and !is_blackhole(body_term)) {
+                                _ = try_spawn_heap_item(c, body_term, body_loc);
+                            }
+                        }
+                    }
+                }
+                stack[spos] = next;
+                spos += 1;
+                next = heap_atomic_get(val);
+                continue;
+            },
+
+            P02 => {
+                if (PAR_SPAWN_P02 and spos < PAR_P02_SPAWN_SPOS_MAX) {
+                    if (ctx) |c| {
+                        if (num_workers > 1) {
+                            const right_loc = val + 1;
+                            const right_term = heap_atomic_get(right_loc);
+                            const clean = right_term & ~SUB_BIT;
+                            if (!term_is_val(clean) and !is_blackhole(right_term)) {
+                                _ = try_enqueue_parallel_item(c.id, c.pending, c.inline_items, c.inline_top, .{
+                                    .term = right_term,
+                                    .result_slot = &HVM.heap[right_loc],
+                                    .spawn_depth = 0,
+                                    .is_heap = true,
+                                    .heap_loc = right_loc,
+                                });
+                            }
+                        }
+                    }
+                }
+                stack[spos] = term_new(F_OP2, ext, val);
+                spos += 1;
+                next = heap_atomic_get(val);
+                continue;
+            },
+
+            EQL => {
+                stack[spos] = term_new(F_EQL, ext, val);
+                spos += 1;
+                next = heap_atomic_get(val);
+                continue;
+            },
+
+            RED => {
+                next = heap_atomic_get(val);
+                continue;
+            },
+
+            ANN => {
+                stack[spos] = term_new(F_ANN, ext, val);
+                spos += 1;
+                next = heap_atomic_get(val);
+                continue;
+            },
+
+            BRI => {
+                stack[spos] = term_new(F_BRI, ext, val);
+                spos += 1;
+                next = heap_atomic_get(val);
+                continue;
+            },
+
+            TYP => {
+                if (spos == 0) break;
+                spos -= 1;
+                const prev = stack[spos];
+                const p_tag = term_tag(prev);
+                const p_val = term_val(prev);
+
+                if (p_tag == F_ANN) {
+                    local_interactions += 1;
+                    next = heap_atomic_get(p_val);
+                    continue;
+                }
+
+                heap_atomic_set(p_val, next);
+                return next;
+            },
+
+            LAM, SUP, ERA, NUM,
+            C00, C01, C02, C03, C04, C05, C06, C07,
+            C08, C09, C10, C11, C12, C13, C14, C15 => {
+                if (spos == 0) break;
+                spos -= 1;
+                const prev = stack[spos];
+                const p_tag = term_tag(prev);
+                const p_ext = term_ext(prev);
+                const p_val = term_val(prev);
+
+                if (p_tag == APP and tag == LAM) {
+                    local_interactions += 1;
+                    const app_loc = p_val;
+                    const lam_loc = val;
+                    heap_atomic_set(app_loc, next);
+                    const arg = heap_atomic_get(app_loc + 1);
+                    const bod = heap_atomic_get(lam_loc);
+                    heap_atomic_set(lam_loc, term_set_sub(arg));
+                    next = bod;
+                    continue;
+                }
+
+                if (p_tag == APP and tag == ERA) {
+                    local_interactions += 1;
+                    next = term_new(ERA, 0, 0);
+                    continue;
+                }
+
+                if (p_tag == APP and tag == SUP) {
+                    local_interactions += 1;
+                    const app_loc = p_val;
+                    const sup_loc = val;
+                    const sup_lab = ext;
+                    const arg = heap_atomic_get(app_loc + 1);
+                    const lft = heap_atomic_get(sup_loc);
+                    const rgt = heap_atomic_get(sup_loc + 1);
+
+                    const base_loc: Val = alloc(7);
+                    const dup_loc: Val = base_loc;
+                    const app0_loc: Val = base_loc + 1;
+                    const app1_loc: Val = base_loc + 3;
+                    const res_loc: Val = base_loc + 5;
+
+                    heap_atomic_set(dup_loc, arg);
+                    heap_atomic_set(app0_loc, lft);
+                    heap_atomic_set(app0_loc + 1, term_new(CO0, sup_lab, dup_loc));
+                    heap_atomic_set(app1_loc, rgt);
+                    heap_atomic_set(app1_loc + 1, term_new(CO1, sup_lab, dup_loc));
+                    heap_atomic_set(res_loc, term_new(APP, 0, app0_loc));
+                    heap_atomic_set(res_loc + 1, term_new(APP, 0, app1_loc));
+
+                    next = term_new(SUP, sup_lab, res_loc);
+                    continue;
+                }
+
+                if ((p_tag == CO0 or p_tag == CO1) and tag == SUP) {
+                    local_interactions += 1;
+                    const dup_loc = p_val;
+                    const dup_lab = p_ext;
+                    const sup_loc = val;
+                    const sup_lab = ext;
+
+                    if (dup_lab == sup_lab) {
+                        const lft = heap_atomic_get(sup_loc);
+                        const rgt = heap_atomic_get(sup_loc + 1);
+                        if (p_tag == CO0) {
+                            heap_atomic_set(dup_loc, term_set_sub(rgt));
+                            next = lft;
+                        } else {
+                            heap_atomic_set(dup_loc, term_set_sub(lft));
+                            next = rgt;
+                        }
+                    } else {
+                        commutation_count += 1;
+                        const new_loc: Val = alloc(4);
+                        heap_atomic_set(new_loc, term_new(CO0, dup_lab, sup_loc));
+                        heap_atomic_set(new_loc + 1, term_new(CO0, dup_lab, sup_loc + 1));
+                        heap_atomic_set(new_loc + 2, term_new(CO1, dup_lab, sup_loc));
+                        heap_atomic_set(new_loc + 3, term_new(CO1, dup_lab, sup_loc + 1));
+
+                        if (p_tag == CO0) {
+                            heap_atomic_set(dup_loc, term_set_sub(term_new(SUP, sup_lab, new_loc + 2)));
+                            next = term_new(SUP, sup_lab, new_loc);
+                        } else {
+                            heap_atomic_set(dup_loc, term_set_sub(term_new(SUP, sup_lab, new_loc)));
+                            next = term_new(SUP, sup_lab, new_loc + 2);
+                        }
+                    }
+                    continue;
+                }
+
+                if ((p_tag == CO0 or p_tag == CO1) and tag == NUM) {
+                    local_interactions += 1;
+                    heap_atomic_set(p_val, term_set_sub(next));
+                    continue;
+                }
+
+                if ((p_tag == CO0 or p_tag == CO1) and tag == ERA) {
+                    local_interactions += 1;
+                    heap_atomic_set(p_val, term_set_sub(term_new(ERA, 0, 0)));
+                    next = term_new(ERA, 0, 0);
+                    continue;
+                }
+
+                if ((p_tag == CO0 or p_tag == CO1) and tag == LAM) {
+                    local_interactions += 1;
+                    const dup_loc = p_val;
+                    const dup_lab = p_ext;
+                    const lam_loc = val;
+                    const bod = heap_atomic_get(lam_loc);
+
+                    const base_loc: Val = alloc(3);
+                    const inner_dup: Val = base_loc;
+                    const lam0_loc: Val = base_loc + 1;
+                    const lam1_loc: Val = base_loc + 2;
+
+                    heap_atomic_set(inner_dup, bod);
+                    heap_atomic_set(lam0_loc, term_new(CO0, dup_lab, inner_dup));
+                    heap_atomic_set(lam1_loc, term_new(CO1, dup_lab, inner_dup));
+
+                    if (p_tag == CO0) {
+                        heap_atomic_set(dup_loc, term_set_sub(term_new(LAM, 0, lam1_loc)));
+                        next = term_new(LAM, 0, lam0_loc);
+                    } else {
+                        heap_atomic_set(dup_loc, term_set_sub(term_new(LAM, 0, lam0_loc)));
+                        next = term_new(LAM, 0, lam1_loc);
+                    }
+                    continue;
+                }
+
+                if ((p_tag == CO0 or p_tag == CO1) and tag >= C00 and tag <= C15) {
+                    local_interactions += 1;
+                    const dup_loc = p_val;
+                    const dup_lab = p_ext;
+                    const ctr_loc = val;
+                    const ctr_ext = ext;
+                    const arity = ctr_arity(tag);
+
+                    if (arity == 0) {
+                        const ctr = term_new(tag, ctr_ext, ctr_loc);
+                        heap_atomic_set(dup_loc, term_set_sub(ctr));
+                        next = ctr;
+                        continue;
+                    }
+
+                    const needed = 3 * arity;
+                    const base_loc: Val = alloc(@as(u64, needed));
+                    const arity_val: Val = @intCast(arity);
+
+                    for (0..arity) |i| {
+                        const idx: Val = @intCast(i);
+                        const dup_i: Val = base_loc + idx;
+                        heap_atomic_set(dup_i, heap_atomic_get(ctr_loc + idx));
+                    }
+
+                    const ctr0_base: Val = base_loc + arity_val;
+                    const ctr1_base: Val = base_loc + arity_val * 2;
+
+                    for (0..arity) |i| {
+                        const idx: Val = @intCast(i);
+                        const dup_i: Val = base_loc + idx;
+                        heap_atomic_set(ctr0_base + idx, term_new(CO0, dup_lab, dup_i));
+                        heap_atomic_set(ctr1_base + idx, term_new(CO1, dup_lab, dup_i));
+                    }
+
+                    if (p_tag == CO0) {
+                        heap_atomic_set(dup_loc, term_set_sub(term_new(tag, ctr_ext, ctr1_base)));
+                        next = term_new(tag, ctr_ext, ctr0_base);
+                    } else {
+                        heap_atomic_set(dup_loc, term_set_sub(term_new(tag, ctr_ext, ctr0_base)));
+                        next = term_new(tag, ctr_ext, ctr1_base);
+                    }
+                    continue;
+                }
+
+                if (p_tag == MAT and tag >= C00 and tag <= C15) {
+                    local_interactions += 1;
+                    const ctr_loc = val;
+                    const mat_loc = p_val;
+                    const case_idx = ext;
+                    const arity = ctr_arity(tag);
+
+                    var branch = heap_atomic_get(mat_loc + 1 + case_idx);
+                    for (0..arity) |i| {
+                        const field = heap_atomic_get(ctr_loc + i);
+                        const loc: Val = alloc(2);
+                        heap_atomic_set(loc, branch);
+                        heap_atomic_set(loc + 1, field);
+                        branch = term_new(APP, 0, loc);
+                    }
+                    next = branch;
+                    continue;
+                }
+
+                if (p_tag == SWI and tag == NUM) {
+                    local_interactions += 1;
+                    const num_val = val;
+                    if (num_val == 0) {
+                        next = heap_atomic_get(p_val + 1);
+                    } else {
+                        const succ = heap_atomic_get(p_val + 2);
+                        const loc: Val = alloc(2);
+                        heap_atomic_set(loc, succ);
+                        heap_atomic_set(loc + 1, term_new(NUM, 0, num_val - 1));
+                        next = term_new(APP, 0, loc);
+                    }
+                    continue;
+                }
+
+                if (p_tag == VAR) {
+                    heap_atomic_set(p_val, term_set_sub(next));
+                    continue;
+                }
+
+                if (p_tag == F_OP2 and tag == NUM) {
+                    local_interactions += 1;
+                    heap_atomic_set(p_val, next);
+                    stack[spos] = term_new(F_OP2 + 1, p_ext, p_val);
+                    spos += 1;
+                    const right_loc: Val = p_val + 1;
+                    while (true) {
+                        const cur = heap_atomic_get(right_loc);
+                        if ((cur & SUB_BIT) != 0) {
+                            next = cur & ~SUB_BIT;
+                            break;
+                        }
+                        if (is_blackhole(cur)) {
+                            next = wait_for_slot(ctx, right_loc);
+                            break;
+                        }
+                        if (ctx) |c| {
+                            if (heap_atomic_cas(right_loc, cur, make_blackhole(right_loc, @intCast(c.id)))) {
+                                next = cur;
+                                break;
+                            }
+                        } else {
+                            next = cur;
+                            break;
+                        }
+                    }
+                    continue;
+                }
+
+                if (p_tag == F_OP2 + 1 and tag == NUM) {
+                    local_interactions += 1;
+                    heap_atomic_set(p_val + 1, term_set_sub(next));
+                    const x = term_val(heap_atomic_get(p_val));
+                    const y = val;
+                    next = term_new(NUM, 0, compute_op(p_ext, x, y));
+                    continue;
+                }
+
+                if (p_tag == LET) {
+                    local_interactions += 1;
+                    const bod = heap_atomic_get(p_val + 1);
+                    heap_atomic_set(p_val, term_set_sub(next));
+                    next = bod;
+                    continue;
+                }
+
+                if (p_tag == F_EQL) {
+                    local_interactions += 1;
+                    const eql_loc = p_val;
+                    const arg1 = heap_atomic_get(eql_loc + 1);
+                    heap_atomic_set(eql_loc, next);
+                    stack[spos] = term_new(F_EQL2, p_ext, eql_loc);
+                    spos += 1;
+                    next = arg1;
+                    continue;
+                }
+
+                if (p_tag == F_EQL2) {
+                    local_interactions += 1;
+                    const first = heap_atomic_get(p_val);
+                    const second = next;
+                    const eq_stack = if (spos < stack.len) stack[spos..] else stack[0..0];
+                    const equal = struct_equal_parallel(first, second, eq_stack, &local_interactions, ctx);
+                    next = term_new(NUM, 0, if (equal) 1 else 0);
+                    continue;
+                }
+
+                if (p_tag == F_ANN) {
+                    local_interactions += 1;
+                    const typ = heap_atomic_get(p_val + 1);
+                    const typ_tag = term_tag(typ);
+
+                    if (tag == SUP) {
+                        const sup_loc = val;
+                        const sup_ext = ext;
+
+                        const loc0 = alloc(2);
+                        heap_atomic_set(loc0, heap_atomic_get(sup_loc));
+                        heap_atomic_set(loc0 + 1, typ);
+
+                        const loc1 = alloc(2);
+                        heap_atomic_set(loc1, heap_atomic_get(sup_loc + 1));
+                        heap_atomic_set(loc1 + 1, typ);
+
+                        const new_loc = alloc(2);
+                        heap_atomic_set(new_loc, term_new(ANN, 0, @truncate(loc0)));
+                        heap_atomic_set(new_loc + 1, term_new(ANN, 0, @truncate(loc1)));
+
+                        next = term_new(SUP, sup_ext, @truncate(new_loc));
+                        continue;
+                    }
+
+                    if (tag == LAM and typ_tag == ALL) {
+                        const typ_val = term_val(typ);
+                        _ = heap_atomic_get(typ_val);
+                        const codomain_lam = heap_atomic_get(typ_val + 1);
+
+                        if (term_tag(codomain_lam) == LAM) {
+                            const codomain_loc = term_val(codomain_lam);
+                            const codomain = heap_atomic_get(codomain_loc);
+
+                            const lam_body = heap_atomic_get(val);
+                            const ann_loc = alloc(2);
+                            heap_atomic_set(ann_loc, lam_body);
+                            heap_atomic_set(ann_loc + 1, codomain);
+
+                            const new_lam_loc = alloc(1);
+                            heap_atomic_set(new_lam_loc, term_new(ANN, 0, @truncate(ann_loc)));
+                            next = term_new(LAM, ext, @truncate(new_lam_loc));
+                            continue;
+                        }
+
+                        next = term_new(tag, ext, val);
+                        continue;
+                    }
+
+                    if (tag >= C00 and tag <= C15 and typ_tag == SIG) {
+                        const arity = ctr_arity(tag);
+                        if (arity >= 2) {
+                            const typ_val = term_val(typ);
+                            const fst_type = heap_atomic_get(typ_val);
+                            const snd_type_lam = heap_atomic_get(typ_val + 1);
+
+                            const fst_elem = heap_atomic_get(val);
+
+                            const ann_fst_loc = alloc(2);
+                            heap_atomic_set(ann_fst_loc, fst_elem);
+                            heap_atomic_set(ann_fst_loc + 1, fst_type);
+                            const ann_fst = term_new(ANN, 0, @truncate(ann_fst_loc));
+
+                            if (term_tag(snd_type_lam) == LAM) {
+                                const snd_elem = heap_atomic_get(val + 1);
+                                const snd_type_loc = term_val(snd_type_lam);
+                                const snd_type_body = heap_atomic_get(snd_type_loc);
+
+                                const ann_snd_loc = alloc(2);
+                                heap_atomic_set(ann_snd_loc, snd_elem);
+                                heap_atomic_set(ann_snd_loc + 1, snd_type_body);
+
+                                const new_ctr_loc = alloc(arity);
+                                heap_atomic_set(new_ctr_loc, ann_fst);
+                                heap_atomic_set(new_ctr_loc + 1, term_new(ANN, 0, @truncate(ann_snd_loc)));
+                                for (2..arity) |i| {
+                                    heap_atomic_set(new_ctr_loc + i, heap_atomic_get(val + i));
+                                }
+                                next = term_new(tag, ext, @truncate(new_ctr_loc));
+                                continue;
+                            }
+                        }
+                    }
+
+                    if (tag == NUM) {
+                        next = term_new(tag, ext, val);
+                        continue;
+                    }
+
+                    if (tag == TYP) {
+                        next = term_new(tag, ext, val);
+                        continue;
+                    }
+
+                    next = term_new(tag, ext, val);
+                    continue;
+                }
+
+                if (p_tag == F_BRI) {
+                    local_interactions += 1;
+                    next = term_new(tag, ext, val);
+                    continue;
+                }
+
+                heap_atomic_set(p_val, next);
+                return next;
+            },
+
+            else => break,
+        }
+    }
+
+    return next;
+}
+
+fn struct_equal_parallel(a: Term, b: Term, stack: []Term, interactions: *u64, ctx: ?*WorkerContext) bool {
+    var work_stack: [4096]EqWorkItem = undefined;
+    var stack_pos: usize = 0;
+
+    var eval_stack = stack;
+    var owned_stack: ?[]Term = null;
+    if (eval_stack.len < 1024) {
+        owned_stack = HVM.allocator.alloc(Term, PAR_EVAL_STACK_SIZE) catch return false;
+        eval_stack = owned_stack.?;
+    }
+    defer if (owned_stack) |buf| HVM.allocator.free(buf);
+
+    work_stack[0] = .{ .a = a, .b = b };
+    stack_pos = 1;
+
+    while (stack_pos > 0) {
+        stack_pos -= 1;
+        const item = work_stack[stack_pos];
+
+        const a_reduced = reduce_parallel_atomic(item.a, eval_stack, interactions, ctx);
+        const b_reduced = reduce_parallel_atomic(item.b, eval_stack, interactions, ctx);
+
+        const a_tag = term_tag(a_reduced);
+        const b_tag = term_tag(b_reduced);
+        if (a_tag != b_tag) return false;
+
+        const a_ext = term_ext(a_reduced);
+        const b_ext = term_ext(b_reduced);
+        const a_val = term_val(a_reduced);
+        const b_val = term_val(b_reduced);
+
+        switch (a_tag) {
+            ERA, TYP => {},
+            NUM => {
+                if (a_val != b_val) return false;
+            },
+            VAR => {
+                if (a_val != b_val) return false;
+            },
+            REF => {
+                if (a_ext != b_ext) return false;
+            },
+            LAM => {
+                if (stack_pos >= work_stack.len) return false;
+                work_stack[stack_pos] = .{
+                    .a = heap_atomic_get(a_val),
+                    .b = heap_atomic_get(b_val),
+                };
+                stack_pos += 1;
+            },
+            APP => {
+                if (stack_pos + 2 > work_stack.len) return false;
+                work_stack[stack_pos] = .{
+                    .a = heap_atomic_get(a_val),
+                    .b = heap_atomic_get(b_val),
+                };
+                work_stack[stack_pos + 1] = .{
+                    .a = heap_atomic_get(a_val + 1),
+                    .b = heap_atomic_get(b_val + 1),
+                };
+                stack_pos += 2;
+            },
+            SUP => {
+                if (a_ext != b_ext) return false;
+                if (stack_pos + 2 > work_stack.len) return false;
+                work_stack[stack_pos] = .{
+                    .a = heap_atomic_get(a_val),
+                    .b = heap_atomic_get(b_val),
+                };
+                work_stack[stack_pos + 1] = .{
+                    .a = heap_atomic_get(a_val + 1),
+                    .b = heap_atomic_get(b_val + 1),
+                };
+                stack_pos += 2;
+            },
+            C00, C01, C02, C03, C04, C05, C06, C07,
+            C08, C09, C10, C11, C12, C13, C14, C15 => {
+                if (a_ext != b_ext) return false;
+                const arity = ctr_arity(a_tag);
+                if (stack_pos + arity > work_stack.len) return false;
+                for (0..arity) |i| {
+                    work_stack[stack_pos + i] = .{
+                        .a = heap_atomic_get(a_val + i),
+                        .b = heap_atomic_get(b_val + i),
+                    };
+                }
+                stack_pos += arity;
+            },
+            else => return false,
+        }
+    }
+
+    return true;
+}
+
+fn enqueue_parallel_item(
+    worker_id: usize,
+    pending: *std.atomic.Value(u64),
+    inline_items: *[PAR_INLINE_STACK_SIZE]ParallelWorkItem,
+    inline_top: *usize,
+    item: ParallelWorkItem,
+) void {
+    _ = pending.fetchAdd(1, .acq_rel);
+    if (work_queues[worker_id].push(item)) return;
+
+    if (inline_top.* < inline_items.len) {
+        inline_items[inline_top.*] = item;
+        inline_top.* += 1;
+        return;
+    }
+
+    while (!work_queues[worker_id].push(item)) {
+        std.Thread.yield() catch {};
+    }
+}
+
+fn try_enqueue_parallel_item(
+    worker_id: usize,
+    pending: *std.atomic.Value(u64),
+    inline_items: *[PAR_INLINE_STACK_SIZE]ParallelWorkItem,
+    inline_top: *usize,
+    item: ParallelWorkItem,
+) bool {
+    if (work_queues[worker_id].push(item)) {
+        _ = pending.fetchAdd(1, .acq_rel);
+        _ = parallel_spawns.fetchAdd(1, .acq_rel);
+        return true;
+    }
+
+    if (inline_top.* < inline_items.len) {
+        _ = pending.fetchAdd(1, .acq_rel);
+        _ = parallel_spawns.fetchAdd(1, .acq_rel);
+        inline_items[inline_top.*] = item;
+        inline_top.* += 1;
+        return true;
+    }
+
+    return false;
+}
+
+fn try_spawn_heap_item(
+    ctx: *WorkerContext,
+    term: Term,
+    heap_loc: Val,
+) bool {
+    const claimed = make_blackhole(heap_loc, @intCast(ctx.id));
+    if (!heap_atomic_cas(heap_loc, term, claimed)) return false;
+
+    if (try_enqueue_parallel_item(ctx.id, ctx.pending, ctx.inline_items, ctx.inline_top, .{
+        .term = term,
+        .result_slot = &HVM.heap[heap_loc],
+        .spawn_depth = 0,
+        .is_heap = true,
+        .heap_loc = heap_loc,
+    })) {
+        return true;
+    }
+
+    heap_atomic_set(heap_loc, term);
+    return false;
+}
+
+fn push_inline_or_queue(
+    worker_id: usize,
+    pending: *std.atomic.Value(u64),
+    inline_items: *[PAR_INLINE_STACK_SIZE]ParallelWorkItem,
+    inline_top: *usize,
+    item: ParallelWorkItem,
+) void {
+    if (inline_top.* < inline_items.len) {
+        _ = pending.fetchAdd(1, .acq_rel);
+        inline_items[inline_top.*] = item;
+        inline_top.* += 1;
+        return;
+    }
+    enqueue_parallel_item(worker_id, pending, inline_items, inline_top, item);
+}
+
+fn schedule_parallel_children(
+    worker_id: usize,
+    pending: *std.atomic.Value(u64),
+    inline_items: *[PAR_INLINE_STACK_SIZE]ParallelWorkItem,
+    inline_top: *usize,
+    spawn_depth: u8,
+    term: Term,
+) void {
+    if (spawn_depth == 0) return;
+    const next_depth: u8 = spawn_depth - 1;
+    const tag = term_tag(term);
+    const val = term_val(term);
+
+    if (tag == LAM) {
+        const child_term = heap_atomic_get(val);
+        if (!is_blackhole(child_term)) {
+            push_inline_or_queue(worker_id, pending, inline_items, inline_top, .{
+                .term = child_term,
+                .result_slot = &HVM.heap[val],
+                .spawn_depth = next_depth,
+                .is_heap = true,
+                .heap_loc = val,
+            });
+        }
+        return;
+    }
+
+    if (tag == SUP) {
+        const term0 = heap_atomic_get(val);
+        const term1 = heap_atomic_get(val + 1);
+        if (!is_blackhole(term0)) {
+            push_inline_or_queue(worker_id, pending, inline_items, inline_top, .{
+                .term = term0,
+                .result_slot = &HVM.heap[val],
+                .spawn_depth = next_depth,
+                .is_heap = true,
+                .heap_loc = val,
+            });
+        }
+        if (!is_blackhole(term1)) {
+            enqueue_parallel_item(worker_id, pending, inline_items, inline_top, .{
+                .term = term1,
+                .result_slot = &HVM.heap[val + 1],
+                .spawn_depth = next_depth,
+                .is_heap = true,
+                .heap_loc = val + 1,
+            });
+        }
+        return;
+    }
+
+    if (tag >= C00 and tag <= C15) {
+        const arity = ctr_arity(tag);
+        var i: u32 = 0;
+        var scheduled_local = false;
+        while (i < arity) : (i += 1) {
+            const loc: Val = val + i;
+            const child_term = heap_atomic_get(loc);
+            if (!is_blackhole(child_term)) {
+                if (!scheduled_local) {
+                    scheduled_local = true;
+                    push_inline_or_queue(worker_id, pending, inline_items, inline_top, .{
+                        .term = child_term,
+                        .result_slot = &HVM.heap[loc],
+                        .spawn_depth = next_depth,
+                        .is_heap = true,
+                        .heap_loc = loc,
+                    });
+                } else {
+                    enqueue_parallel_item(worker_id, pending, inline_items, inline_top, .{
+                        .term = child_term,
+                        .result_slot = &HVM.heap[loc],
+                        .spawn_depth = next_depth,
+                        .is_heap = true,
+                        .heap_loc = loc,
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn parallel_worker(
+    worker_id: usize,
+    shared_state: *State,
+    pending: *std.atomic.Value(u64),
+    eval_stack: []Term,
+    help_stack: []Term,
+) void {
+    hvm_set_state(shared_state);
+    var local_interactions: u64 = 0;
+    var inline_items: [PAR_INLINE_STACK_SIZE]ParallelWorkItem = undefined;
+    var inline_top: usize = 0;
+    var ctx = WorkerContext{
+        .id = worker_id,
+        .pending = pending,
+        .inline_items = &inline_items,
+        .inline_top = &inline_top,
+        .local_interactions = &local_interactions,
+        .help_stack = help_stack,
+        .help_active = false,
+    };
+
+    while (true) {
+        if (parallel_take_item(&ctx)) |item| {
+            parallel_run_item(&ctx, item, eval_stack);
+            continue;
+        }
+        if (pending.load(.acquire) == 0) break;
+        std.Thread.yield() catch {};
+    }
+
+    _ = parallel_interactions.fetchAdd(local_interactions, .acq_rel);
+}
+
+fn redex_worker(
+    worker_id: usize,
+    root_loc: Val,
+    shared_state: *State,
+    pending: *std.atomic.Value(u64),
+    rescan_active: *std.atomic.Value(bool),
+    done: *std.atomic.Value(bool),
+    eval_stack: []Term,
+    gpu_enabled: bool,
+    gpu: ?*metal.MetalGPU,
+) void {
+    hvm_set_state(shared_state);
+    var local_interactions: u64 = 0;
+    var inline_items: [PAR_REDEX_INLINE_SIZE]RedexWorkItem = undefined;
+    var inline_top: usize = 0;
+    var p02_locs: [PAR_P02_BATCH_CAP]Val = undefined;
+    var p02_ops: [PAR_P02_BATCH_CAP]Ext = undefined;
+    var p02_lefts: [PAR_P02_BATCH_CAP]Val = undefined;
+    var p02_rights: [PAR_P02_BATCH_CAP]Val = undefined;
+    var p02_gpu_ops: [PAR_P02_BATCH_CAP]Term = undefined;
+    var p02_gpu_nums: [PAR_P02_BATCH_CAP]Term = undefined;
+    var p02_gpu_results: [PAR_P02_BATCH_CAP]Term = undefined;
+    var p02_gpu_heap: [PAR_P02_BATCH_CAP]Term = undefined;
+    var p02_count: usize = 0;
+    var ctx = RedexContext{
+        .id = worker_id,
+        .root_loc = root_loc,
+        .pending = pending,
+        .inline_items = &inline_items,
+        .inline_top = &inline_top,
+        .local_interactions = &local_interactions,
+        .rescan_active = rescan_active,
+        .done = done,
+        .eval_stack = eval_stack,
+        .gpu_enabled = gpu_enabled,
+        .gpu = gpu,
+        .p02_locs = p02_locs[0..],
+        .p02_ops = p02_ops[0..],
+        .p02_lefts = p02_lefts[0..],
+        .p02_rights = p02_rights[0..],
+        .p02_gpu_ops = p02_gpu_ops[0..],
+        .p02_gpu_nums = p02_gpu_nums[0..],
+        .p02_gpu_results = p02_gpu_results[0..],
+        .p02_gpu_heap = p02_gpu_heap[0..],
+        .p02_count = &p02_count,
+    };
+
+    redex_worker_loop(&ctx);
+    _ = parallel_interactions.fetchAdd(local_interactions, .acq_rel);
+}
+
+fn compute_spawn_depth(workers: usize) u8 {
+    _ = workers;
+    return 0;
+}
+
+pub fn reduce_parallel(term: Term) Term {
+    if (num_workers <= 1) {
+        return reduce(term);
+    }
+
+    parallel_reduction_init();
+    parallel_interactions.store(0, .release);
+    parallel_spawns.store(0, .release);
+    parallel_alloc_begin();
+
+    const shared_state = HVM;
+    var gpu_ptr: ?*metal.MetalGPU = null;
+    var gpu_enabled = false;
+    if (PAR_P02_GPU_ENABLED and metal.is_supported and metal.isAvailable()) {
+        metal.init() catch {};
+        gpu_ptr = metal.getGPU();
+        gpu_enabled = gpu_ptr != null;
+    }
+    defer if (gpu_ptr != null) {
+        metal.deinit();
+    };
+
+    wait_table_init(shared_state.allocator);
+    wait_table_reset();
+    const root_loc: Val = alloc(1);
+    heap_atomic_set(root_loc, term);
+
+    var pending = std.atomic.Value(u64).init(0);
+    var rescan_active = std.atomic.Value(bool).init(false);
+    var done = std.atomic.Value(bool).init(false);
+
+    for (0..num_workers) |i| {
+        redex_queues[i] = RedexQueue.init(shared_state.allocator, PAR_REDEX_QUEUE_SIZE) catch {
+            print("Error: out of memory allocating redex queue\n", .{});
+            std.process.exit(1);
+        };
+    }
+    defer {
+        for (0..num_workers) |i| {
+            redex_queues[i].deinit(shared_state.allocator);
+        }
+    }
+    parallel_gc_setup(root_loc, &pending, &rescan_active, &done);
+    defer parallel_gc_teardown();
+
+    var eval_stacks: [MAX_WORKERS][]Term = undefined;
+    for (0..num_workers) |i| {
+        eval_stacks[i] = shared_state.allocator.alloc(Term, PAR_EVAL_STACK_SIZE) catch {
+            print("Error: out of memory allocating parallel eval stack\n", .{});
+            std.process.exit(1);
+        };
+    }
+    defer {
+        for (0..num_workers) |i| {
+            shared_state.allocator.free(eval_stacks[i]);
+        }
+    }
+
+    var threads: [MAX_WORKERS]?std.Thread = [_]?std.Thread{null} ** MAX_WORKERS;
+    if (num_workers > 1) {
+        for (1..num_workers) |i| {
+            threads[i] = std.Thread.spawn(.{}, redex_worker, .{
+                i,
+                root_loc,
+                shared_state,
+                &pending,
+                &rescan_active,
+                &done,
+                eval_stacks[i],
+                gpu_enabled,
+                gpu_ptr,
+            }) catch null;
+        }
+    }
+
+    var local_interactions: u64 = 0;
+    var inline_items: [PAR_REDEX_INLINE_SIZE]RedexWorkItem = undefined;
+    var inline_top: usize = 0;
+    var p02_locs: [PAR_P02_BATCH_CAP]Val = undefined;
+    var p02_ops: [PAR_P02_BATCH_CAP]Ext = undefined;
+    var p02_lefts: [PAR_P02_BATCH_CAP]Val = undefined;
+    var p02_rights: [PAR_P02_BATCH_CAP]Val = undefined;
+    var p02_gpu_ops: [PAR_P02_BATCH_CAP]Term = undefined;
+    var p02_gpu_nums: [PAR_P02_BATCH_CAP]Term = undefined;
+    var p02_gpu_results: [PAR_P02_BATCH_CAP]Term = undefined;
+    var p02_gpu_heap: [PAR_P02_BATCH_CAP]Term = undefined;
+    var p02_count: usize = 0;
+    var ctx0 = RedexContext{
+        .id = 0,
+        .root_loc = root_loc,
+        .pending = &pending,
+        .inline_items = &inline_items,
+        .inline_top = &inline_top,
+        .local_interactions = &local_interactions,
+        .rescan_active = &rescan_active,
+        .done = &done,
+        .eval_stack = eval_stacks[0],
+        .gpu_enabled = gpu_enabled,
+        .gpu = gpu_ptr,
+        .p02_locs = p02_locs[0..],
+        .p02_ops = p02_ops[0..],
+        .p02_lefts = p02_lefts[0..],
+        .p02_rights = p02_rights[0..],
+        .p02_gpu_ops = p02_gpu_ops[0..],
+        .p02_gpu_nums = p02_gpu_nums[0..],
+        .p02_gpu_results = p02_gpu_results[0..],
+        .p02_gpu_heap = p02_gpu_heap[0..],
+        .p02_count = &p02_count,
+    };
+
+    _ = redex_scan_demanded(&ctx0);
+    redex_worker_loop(&ctx0);
+    _ = parallel_interactions.fetchAdd(local_interactions, .acq_rel);
+
+    for (threads[1..num_workers]) |maybe_thread| {
+        if (maybe_thread) |thread| thread.join();
+    }
+
+    parallel_alloc_end();
+    HVM.interactions += parallel_interactions.load(.acquire);
+    return heap_atomic_get(root_loc);
+}
+
+const GPU_REDUCE_MAX_ITERS: u32 = 1_000_000;
+const GPU_REDEX_CAP: usize = 8 * 1024 * 1024;
+const GPU_HEAP_HEADROOM: usize = 0;
+const GPU_BATCH_CAP: usize = 16384;
+const GPU_SCAN_MAX_PASSES: u32 = 1_000_000;
+
+fn ensure_gpu_heap_headroom(extra: usize) void {
+    if (extra == 0) return;
+
+    const heap_pos = HVM.heap_pos;
+    const new_len = HVM.heap.len + extra;
+    if (new_len > @as(usize, std.math.maxInt(u32))) {
+        print("Error: GPU heap growth exceeds addressable range\n", .{});
+        std.process.exit(1);
+    }
+
+    const allocator = HVM.allocator;
+    const new_heap = allocator.alloc(Term, new_len) catch {
+        print("Error: failed to grow heap for GPU reduction\n", .{});
+        std.process.exit(1);
+    };
+    const used: usize = @intCast(heap_pos);
+    @memcpy(new_heap[0..used], HVM.heap[0..used]);
+    @memset(new_heap[used..new_len], 0);
+    allocator.free(HVM.heap);
+    HVM.heap = new_heap;
+    HVM.config.heap_size = @intCast(new_len);
+
+    if (HVM.refcounts) |rc| {
+        const new_rc = allocator.alloc(u32, new_len) catch {
+            print("Error: failed to grow refcounts for GPU reduction\n", .{});
+            std.process.exit(1);
+        };
+        @memcpy(new_rc[0..used], rc[0..used]);
+        @memset(new_rc[used..new_len], 0);
+        allocator.free(rc);
+        HVM.refcounts = new_rc;
+    }
+}
+
+pub fn reduce_gpu(term: Term) Term {
+    ensure_gpu_heap_headroom(GPU_HEAP_HEADROOM);
+    if (!metal.is_supported or !metal.isAvailable()) {
+        print("Error: GPU reduction not available on this system\n", .{});
+        std.process.exit(1);
+    }
+
+    metal.init() catch {
+        print("Error: failed to initialize Metal GPU runtime\n", .{});
+        std.process.exit(1);
+    };
+    defer metal.deinit();
+
+    const gpu = metal.getGPU() orelse {
+        print("Error: GPU device not available\n", .{});
+        std.process.exit(1);
+    };
+
+    var templates = build_gpu_templates(HVM.allocator, HVM) catch {
+        print("Error: failed to build GPU templates\n", .{});
+        std.process.exit(1);
+    };
+    defer templates.deinit();
+
+    gpu.uploadTemplates(templates.terms, templates.info) catch {
+        print("Error: failed to upload GPU templates\n", .{});
+        std.process.exit(1);
+    };
+
+    const heap_capacity = HVM.heap.len;
+    if (heap_capacity == 0 or heap_capacity > @as(usize, std.math.maxInt(u32))) {
+        print("Error: GPU heap capacity out of range\n", .{});
+        std.process.exit(1);
+    }
+
+    const redex_capacity = @min(heap_capacity, GPU_REDEX_CAP);
+    gpu.allocGpuResidentState(heap_capacity, redex_capacity) catch {
+        print("Error: failed to allocate GPU resident state\n", .{});
+        std.process.exit(1);
+    };
+
+    const root_loc: Val = alloc(1);
+    HVM.heap[@intCast(root_loc)] = term;
+
+    var heap_len: u32 = @intCast(HVM.heap_pos);
+    gpu.uploadGpuHeap(HVM.heap[0..@intCast(heap_len)]) catch {
+        print("Error: failed to upload heap to GPU\n", .{});
+        std.process.exit(1);
+    };
+
+    if (gpu.alloc_ptr_ptr) |ptr| {
+        ptr.* = heap_len;
+    } else {
+        print("Error: missing GPU allocation pointer\n", .{});
+        std.process.exit(1);
+    }
+    if (DEBUG_GPU_REDUCE) {
+        std.debug.print("gpu init: heap_len={d} alloc_ptr={d}\n", .{ heap_len, gpu.alloc_ptr_ptr.?.* });
+    }
+
+    var total_interactions: u64 = 0;
+    const root_term = term_clr_sub(HVM.heap[@intCast(root_loc)]);
+    if (!redex_is_value(root_term)) {
+        var passes: u32 = 0;
+        while (passes < GPU_SCAN_MAX_PASSES) : (passes += 1) {
+            const found = gpu.scanRedexes(heap_len) catch {
+                print("Error: GPU redex scan failed\n", .{});
+                std.process.exit(1);
+            };
+            if (found == 0) break;
+            const capped = @min(@as(usize, found), redex_capacity);
+            if (found > redex_capacity) {
+                print("Warning: GPU redex scan overflow (found {d}, cap {d})\n", .{ found, redex_capacity });
+            }
+            const stats = gpu.gpuReduceResidentQueued(@intCast(capped), heap_len, GPU_REDUCE_MAX_ITERS) catch {
+                print("Error: GPU reduction resident loop failed\n", .{});
+                std.process.exit(1);
+            };
+            total_interactions += stats.interactions;
+            if (stats.new_redexes != 0) {
+                print("Warning: GPU reduction hit iteration cap ({d})\n", .{GPU_REDUCE_MAX_ITERS});
+            }
+            if (gpu.alloc_ptr_ptr) |ptr| {
+                if (ptr.* > heap_capacity) {
+                    print("Error: GPU heap overflow (alloc={d}, cap={d})\n", .{ ptr.*, heap_capacity });
+                    std.process.exit(1);
+                }
+                if (ptr.* > heap_len) heap_len = ptr.*;
+            }
+            if (gpu.getGpuHeapPtr()) |heap_ptr| {
+                const root_now = term_clr_sub(heap_ptr[@intCast(root_loc)]);
+                if (redex_is_value(root_now)) break;
+            } else {
+                print("Error: missing GPU heap pointer\n", .{});
+                std.process.exit(1);
+            }
+        }
+    }
+
+    if (gpu.alloc_ptr_ptr) |ptr| {
+        if (ptr.* > heap_capacity) {
+            print("Error: GPU heap overflow (alloc={d}, cap={d})\n", .{ ptr.*, heap_capacity });
+            std.process.exit(1);
+        }
+        if (ptr.* > heap_len) heap_len = ptr.*;
+    }
+
+    gpu.downloadGpuHeap(HVM.heap[0..@intCast(heap_len)]) catch {
+        print("Error: failed to download heap from GPU\n", .{});
+        std.process.exit(1);
+    };
+
+    HVM.heap_pos = @intCast(heap_len);
+    HVM.interactions += total_interactions;
+    const result = HVM.heap[@intCast(root_loc)];
+    if (term_tag(result) == APP and term_val(result) == root_loc) {
+        print("Error: GPU reduction produced self-referential APP at root\n", .{});
+        std.process.exit(1);
+    }
+    return result;
+}
+
+fn reduce_parallel_whnf(term: Term) Term {
+    if (num_workers <= 1) {
+        return reduce(term);
+    }
+
+    parallel_reduction_init();
+    parallel_interactions.store(0, .release);
+    parallel_spawns.store(0, .release);
+    parallel_alloc_begin();
+
+    const shared_state = HVM;
+    var root = term;
+    var pending = std.atomic.Value(u64).init(1);
+    const spawn_depth = compute_spawn_depth(num_workers);
+    if (!work_queues[0].push(.{
+        .term = term,
+        .result_slot = &root,
+        .spawn_depth = spawn_depth,
+        .is_heap = false,
+        .heap_loc = 0,
+    })) {
+        print("Error: parallel work queue overflow\n", .{});
+        std.process.exit(1);
+    }
+
+    var stacks: [MAX_WORKERS][]Term = undefined;
+    var help_stacks: [MAX_WORKERS][]Term = undefined;
+    for (0..num_workers) |i| {
+        stacks[i] = shared_state.allocator.alloc(Term, PAR_EVAL_STACK_SIZE) catch {
+            print("Error: out of memory allocating parallel stack\n", .{});
+            std.process.exit(1);
+        };
+        help_stacks[i] = shared_state.allocator.alloc(Term, PAR_EVAL_STACK_SIZE) catch {
+            print("Error: out of memory allocating parallel help stack\n", .{});
+            std.process.exit(1);
+        };
+    }
+    defer {
+        for (0..num_workers) |i| {
+            shared_state.allocator.free(stacks[i]);
+            shared_state.allocator.free(help_stacks[i]);
+        }
+    }
+
+    var threads: [MAX_WORKERS]?std.Thread = [_]?std.Thread{null} ** MAX_WORKERS;
+    for (0..num_workers) |i| {
+        threads[i] = std.Thread.spawn(.{}, parallel_worker, .{ i, shared_state, &pending, stacks[i], help_stacks[i] }) catch null;
+    }
+
+    for (threads[0..num_workers]) |maybe_thread| {
+        if (maybe_thread) |thread| thread.join();
+    }
+
+    parallel_alloc_end();
+    HVM.interactions += parallel_interactions.load(.acquire);
+    return root;
+}
+
+pub fn get_parallel_spawns() u64 {
+    return parallel_spawns.load(.acquire);
+}
+
 // =============================================================================
 // Ultra-Fast Reduce (100x Performance Target)
 // =============================================================================
@@ -2661,11 +6321,15 @@ pub fn reduce_fast(term: Term) Term {
     var spos = stop;
     var next = term;
     var local_interactions: u64 = 0;
+    var gc_ctx = GcContext{ .root = &next, .stack = stack, .spos = &spos, .root_heap_loc = null };
+    const gc_prev = gc_push_context(&gc_ctx);
+    defer gc_pop_context(gc_prev);
 
     while (true) {
-        // Handle substitution - ultra-fast path
-        while ((next & SUB_BIT) != 0) {
-            next = heap[term_val(next)];
+        // Handle substitution - SUB_BIT marks a substituted value
+        if ((next & SUB_BIT) != 0) {
+            next = next & ~SUB_BIT;
+            continue;
         }
 
         const tag: Tag = @truncate((next >> TAG_SHIFT) & 0xFF);
@@ -2679,11 +6343,11 @@ pub fn reduce_fast(term: Term) Term {
                     next = next & ~SUB_BIT;
                     continue;
                 }
-                if (spos > stop) {
-                    spos -= 1;
-                    heap[term_val(stack[spos])] = next;
-                    next = stack[spos];
-                } else break;
+                // VAR points to unreduced content
+                // Push VAR to stack so we can store the result back when done
+                stack[spos] = term_new(VAR, 0, val);
+                spos += 1;
+                continue;
             },
 
             // Collapse projections - hot path
@@ -2735,6 +6399,7 @@ pub fn reduce_fast(term: Term) Term {
                 spos -= 1;
                 const prev = stack[spos];
                 const p_tag: Tag = @truncate((prev >> TAG_SHIFT) & 0xFF);
+                const p_val = term_val(prev);
 
                 // APP + LAM: Ultra-fast beta reduction with chain fusion
                 if (p_tag == APP) {
@@ -2747,20 +6412,21 @@ pub fn reduce_fast(term: Term) Term {
                     var bod = heap[lam_loc];
                     heap[lam_loc] = arg | SUB_BIT;
 
-                    // Speculative chain fusion - keep reducing if it's another APP
-                    while ((bod >> TAG_SHIFT) & 0xFF == APP) {
-                        const next_app_loc = term_val(bod);
-                        const next_func = heap[next_app_loc];
+	                    // Speculative chain fusion - keep reducing if it's another APP
+	                    while ((bod >> TAG_SHIFT) & 0xFF == APP) {
+	                        const next_app_loc = term_val(bod);
+	                        const next_func = heap[next_app_loc];
 
                         // Check if function reduces to LAM
-                        if ((next_func >> TAG_SHIFT) & 0xFF == LAM) {
-                            const next_lam_loc = term_val(next_func);
-                            const next_arg = heap[next_app_loc + 1];
-                            local_interactions += 1;
-                            heap[next_lam_loc] = next_arg | SUB_BIT;
-                            bod = heap[next_lam_loc];
-                        } else break;
-                    }
+	                        if ((next_func >> TAG_SHIFT) & 0xFF == LAM) {
+	                            const next_lam_loc = term_val(next_func);
+	                            const next_arg = heap[next_app_loc + 1];
+	                            local_interactions += 1;
+	                            const next_bod = heap[next_lam_loc];
+	                            heap[next_lam_loc] = next_arg | SUB_BIT;
+	                            bod = next_bod;
+	                        } else break;
+	                    }
 
                     next = bod;
                     continue;
@@ -2775,11 +6441,10 @@ pub fn reduce_fast(term: Term) Term {
                     const bod = heap[lam_loc];
 
                     // Batch allocate
-                    const base_loc = HVM.heap_pos;
-                    HVM.heap_pos += 3;
-                    const inner_dup: Val = @truncate(base_loc);
-                    const lam0_loc: Val = @truncate(base_loc + 1);
-                    const lam1_loc: Val = @truncate(base_loc + 2);
+                    const base_loc: Val = alloc(3);
+                    const inner_dup: Val = base_loc;
+                    const lam0_loc: Val = base_loc + 1;
+                    const lam1_loc: Val = base_loc + 2;
 
                     heap[inner_dup] = bod;
                     heap[lam0_loc] = term_new(CO0, dup_lab, inner_dup);
@@ -2795,6 +6460,21 @@ pub fn reduce_fast(term: Term) Term {
                     continue;
                 }
 
+                // VAR on stack: store the reduced result at VAR's location
+                if (p_tag == VAR) {
+                    heap[p_val] = next | SUB_BIT;
+                    continue;
+                }
+
+                // LET binding
+                if (p_tag == LET) {
+                    local_interactions += 1;
+                    const bod = heap[p_val + 1];
+                    heap[p_val] = next | SUB_BIT;
+                    next = bod;
+                    continue;
+                }
+
                 heap[term_val(prev)] = next;
                 HVM.stack_pos = spos;
                 HVM.interactions += local_interactions;
@@ -2806,6 +6486,7 @@ pub fn reduce_fast(term: Term) Term {
                 spos -= 1;
                 const prev = stack[spos];
                 const p_tag: Tag = @truncate((prev >> TAG_SHIFT) & 0xFF);
+                const p_val = term_val(prev);
 
                 // CO0/CO1 + SUP: Annihilation or commutation
                 if (p_tag == CO0 or p_tag == CO1) {
@@ -2827,13 +6508,12 @@ pub fn reduce_fast(term: Term) Term {
                     } else {
                         // Commutation - creates 4 new nodes
                         commutation_count += 1;
-                        const base_loc = HVM.heap_pos;
-                        HVM.heap_pos += 6;
+                        const base_loc: Val = alloc(6);
 
-                        const dup0: Val = @truncate(base_loc);
-                        const dup1: Val = @truncate(base_loc + 1);
-                        const sup0: Val = @truncate(base_loc + 2);
-                        const sup1: Val = @truncate(base_loc + 4);
+                        const dup0: Val = base_loc;
+                        const dup1: Val = base_loc + 1;
+                        const sup0: Val = base_loc + 2;
+                        const sup1: Val = base_loc + 4;
 
                         heap[dup0] = heap[sup_loc];
                         heap[dup1] = heap[sup_loc + 1];
@@ -2864,12 +6544,11 @@ pub fn reduce_fast(term: Term) Term {
                     const rgt = heap[sup_loc + 1];
 
                     // Batch allocate 7 slots
-                    const base_loc = HVM.heap_pos;
-                    HVM.heap_pos += 7;
-                    const dup_loc: Val = @truncate(base_loc);
-                    const app0_loc: Val = @truncate(base_loc + 1);
-                    const app1_loc: Val = @truncate(base_loc + 3);
-                    const res_loc: Val = @truncate(base_loc + 5);
+                    const base_loc: Val = alloc(7);
+                    const dup_loc: Val = base_loc;
+                    const app0_loc: Val = base_loc + 1;
+                    const app1_loc: Val = base_loc + 3;
+                    const res_loc: Val = base_loc + 5;
 
                     heap[dup_loc] = arg;
                     heap[app0_loc] = lft;
@@ -2880,6 +6559,21 @@ pub fn reduce_fast(term: Term) Term {
                     heap[res_loc + 1] = term_new(APP, 0, app1_loc);
 
                     next = term_new(SUP, sup_lab, res_loc);
+                    continue;
+                }
+
+                // VAR on stack: store the reduced result at VAR's location
+                if (p_tag == VAR) {
+                    heap[p_val] = next | SUB_BIT;
+                    continue;
+                }
+
+                // LET binding
+                if (p_tag == LET) {
+                    local_interactions += 1;
+                    const bod = heap[p_val + 1];
+                    heap[p_val] = next | SUB_BIT;
+                    next = bod;
                     continue;
                 }
 
@@ -2897,6 +6591,12 @@ pub fn reduce_fast(term: Term) Term {
                 const p_ext = term_ext(prev);
                 const p_val = term_val(prev);
 
+                // VAR on stack: store the reduced result at VAR's location
+                if (p_tag == VAR) {
+                    heap[p_val] = next | SUB_BIT;
+                    continue;
+                }
+
                 // CO0/CO1 + NUM: Trivial duplication
                 if (p_tag == CO0 or p_tag == CO1) {
                     local_interactions += 1;
@@ -2912,11 +6612,10 @@ pub fn reduce_fast(term: Term) Term {
                         next = heap[p_val + 1];
                     } else {
                         const succ = heap[p_val + 2];
-                        const loc = HVM.heap_pos;
-                        HVM.heap_pos += 2;
+                        const loc: Val = alloc(2);
                         heap[loc] = succ;
                         heap[loc + 1] = term_new(NUM, 0, num_val - 1);
-                        next = term_new(APP, 0, @truncate(loc));
+                        next = term_new(APP, 0, loc);
                     }
                     continue;
                 }
@@ -2940,6 +6639,15 @@ pub fn reduce_fast(term: Term) Term {
                     continue;
                 }
 
+                // LET binding
+                if (p_tag == LET) {
+                    local_interactions += 1;
+                    const bod = heap[p_val + 1];
+                    heap[p_val] = next | SUB_BIT;
+                    next = bod;
+                    continue;
+                }
+
                 heap[p_val] = next;
                 HVM.stack_pos = spos;
                 HVM.interactions += local_interactions;
@@ -2951,6 +6659,7 @@ pub fn reduce_fast(term: Term) Term {
                 spos -= 1;
                 const prev = stack[spos];
                 const p_tag: Tag = @truncate((prev >> TAG_SHIFT) & 0xFF);
+                const p_val = term_val(prev);
 
                 // APP + ERA: Erasure
                 if (p_tag == APP) {
@@ -2967,6 +6676,21 @@ pub fn reduce_fast(term: Term) Term {
                     continue;
                 }
 
+                // VAR on stack: store the reduced result at VAR's location
+                if (p_tag == VAR) {
+                    heap[p_val] = next | SUB_BIT;
+                    continue;
+                }
+
+                // LET binding
+                if (p_tag == LET) {
+                    local_interactions += 1;
+                    const bod = heap[p_val + 1];
+                    heap[p_val] = next | SUB_BIT;
+                    next = bod;
+                    continue;
+                }
+
                 heap[term_val(prev)] = next;
                 HVM.stack_pos = spos;
                 HVM.interactions += local_interactions;
@@ -2979,6 +6703,13 @@ pub fn reduce_fast(term: Term) Term {
                 spos -= 1;
                 const prev = stack[spos];
                 const p_tag: Tag = @truncate((prev >> TAG_SHIFT) & 0xFF);
+                const p_val = term_val(prev);
+
+                // VAR on stack: store the reduced result at VAR's location
+                if (p_tag == VAR) {
+                    heap[p_val] = next | SUB_BIT;
+                    continue;
+                }
 
                 // MAT + CTR: Pattern match
                 if (p_tag == MAT) {
@@ -2991,11 +6722,10 @@ pub fn reduce_fast(term: Term) Term {
                     var branch = heap[mat_loc + 1 + case_idx];
                     for (0..arity) |i| {
                         const field = heap[ctr_loc + i];
-                        const loc = HVM.heap_pos;
-                        HVM.heap_pos += 2;
+                        const loc: Val = alloc(2);
                         heap[loc] = branch;
                         heap[loc + 1] = field;
-                        branch = term_new(APP, 0, @truncate(loc));
+                        branch = term_new(APP, 0, loc);
                     }
                     next = branch;
                     continue;
@@ -3017,21 +6747,21 @@ pub fn reduce_fast(term: Term) Term {
 
                     // Batch allocate
                     const needed = 3 * arity;
-                    const base_loc = HVM.heap_pos;
-                    HVM.heap_pos += needed;
+                    const base_loc: Val = alloc(@as(u64, needed));
+                    const arity_val: Val = @intCast(arity);
 
                     for (0..arity) |i| {
-                        const idx: Val = @truncate(i);
-                        const dup_i: Val = @truncate(base_loc + i);
+                        const idx: Val = @intCast(i);
+                        const dup_i: Val = base_loc + idx;
                         heap[dup_i] = heap[ctr_loc + idx];
                     }
 
-                    const ctr0_base: Val = @truncate(base_loc + arity);
-                    const ctr1_base: Val = @truncate(base_loc + 2 * arity);
+                    const ctr0_base: Val = base_loc + arity_val;
+                    const ctr1_base: Val = base_loc + arity_val * 2;
 
                     for (0..arity) |i| {
-                        const idx: Val = @truncate(i);
-                        const dup_i: Val = @truncate(base_loc + i);
+                        const idx: Val = @intCast(i);
+                        const dup_i: Val = base_loc + idx;
                         heap[ctr0_base + idx] = term_new(CO0, dup_lab, dup_i);
                         heap[ctr1_base + idx] = term_new(CO1, dup_lab, dup_i);
                     }
@@ -3043,6 +6773,15 @@ pub fn reduce_fast(term: Term) Term {
                         heap[dup_loc] = term_new(tag, ctr_ext, ctr0_base) | SUB_BIT;
                         next = term_new(tag, ctr_ext, ctr1_base);
                     }
+                    continue;
+                }
+
+                // LET binding
+                if (p_tag == LET) {
+                    local_interactions += 1;
+                    const bod = heap[p_val + 1];
+                    heap[p_val] = next | SUB_BIT;
+                    next = bod;
                     continue;
                 }
 
@@ -3475,8 +7214,9 @@ pub fn reduce_atomic(heap: *AtomicHeap, term: Term) Term {
 
     while (true) {
         // Follow substitutions atomically
-        while ((next & SUB_BIT) != 0) {
-            next = heap.get(term_val(next));
+        if ((next & SUB_BIT) != 0) {
+            next = next & ~SUB_BIT;
+            continue;
         }
 
         const tag = term_tag(next);
@@ -3794,13 +7534,11 @@ fn handle_var(state: *ReduceState) Term {
         state.next = state.next & ~SUB_BIT;
         return dispatch(state);
     }
-    if (state.spos > state.stop) {
-        state.spos -= 1;
-        state.heap[term_val(state.stack[state.spos])] = state.next;
-        state.next = state.stack[state.spos];
-        return dispatch(state);
-    }
-    return state.next;
+    // VAR points to unreduced content
+    // Push VAR to stack so we can store the result back when done
+    state.stack[state.spos] = term_new(VAR, 0, val);
+    state.spos += 1;
+    return dispatch(state);
 }
 
 /// CO0/CO1 handler - collapse projection
@@ -3854,6 +7592,7 @@ fn handle_lam(state: *ReduceState) Term {
     state.spos -= 1;
     const prev = state.stack[state.spos];
     const p_tag = term_tag(prev);
+    const p_val = term_val(prev);
 
     // APP + LAM: Inline beta reduction (hottest path)
     if (p_tag == APP) {
@@ -3876,11 +7615,10 @@ fn handle_lam(state: *ReduceState) Term {
         const lam_loc = term_val(state.next);
         const bod = state.heap[lam_loc];
 
-        const base = HVM.heap_pos;
-        HVM.heap_pos += 3;
-        const inner_dup: Val = @truncate(base);
-        const lam0_loc: Val = @truncate(base + 1);
-        const lam1_loc: Val = @truncate(base + 2);
+        const base: Val = alloc(3);
+        const inner_dup: Val = base;
+        const lam0_loc: Val = base + 1;
+        const lam1_loc: Val = base + 2;
 
         state.heap[inner_dup] = bod;
         state.heap[lam0_loc] = term_new(CO0, dup_lab, inner_dup);
@@ -3896,6 +7634,19 @@ fn handle_lam(state: *ReduceState) Term {
         return dispatch(state);
     }
 
+    if (p_tag == VAR) {
+        state.heap[p_val] = state.next | SUB_BIT;
+        return dispatch(state);
+    }
+
+    if (p_tag == LET) {
+        state.interactions.* += 1;
+        const bod = state.heap[p_val + 1];
+        state.heap[p_val] = state.next | SUB_BIT;
+        state.next = bod;
+        return dispatch(state);
+    }
+
     state.heap[term_val(prev)] = state.next;
     return state.next;
 }
@@ -3907,6 +7658,7 @@ fn handle_sup(state: *ReduceState) Term {
     state.spos -= 1;
     const prev = state.stack[state.spos];
     const p_tag = term_tag(prev);
+    const p_val = term_val(prev);
 
     // CO0/CO1 + SUP: Annihilation or commutation
     if (p_tag == CO0 or p_tag == CO1) {
@@ -3930,13 +7682,12 @@ fn handle_sup(state: *ReduceState) Term {
         } else {
             // Commutation
             commutation_count += 1;
-            const base = HVM.heap_pos;
-            HVM.heap_pos += 6;
+            const base: Val = alloc(6);
 
-            const dup0: Val = @truncate(base);
-            const dup1: Val = @truncate(base + 1);
-            const sup0: Val = @truncate(base + 2);
-            const sup1: Val = @truncate(base + 4);
+            const dup0: Val = base;
+            const dup1: Val = base + 1;
+            const sup0: Val = base + 2;
+            const sup1: Val = base + 4;
 
             state.heap[dup0] = state.heap[sup_loc];
             state.heap[dup1] = state.heap[sup_loc + 1];
@@ -3966,12 +7717,11 @@ fn handle_sup(state: *ReduceState) Term {
         const lft = state.heap[sup_loc];
         const rgt = state.heap[sup_loc + 1];
 
-        const base = HVM.heap_pos;
-        HVM.heap_pos += 7;
-        const dup_loc: Val = @truncate(base);
-        const app0_loc: Val = @truncate(base + 1);
-        const app1_loc: Val = @truncate(base + 3);
-        const res_loc: Val = @truncate(base + 5);
+        const base: Val = alloc(7);
+        const dup_loc: Val = base;
+        const app0_loc: Val = base + 1;
+        const app1_loc: Val = base + 3;
+        const res_loc: Val = base + 5;
 
         state.heap[dup_loc] = arg;
         state.heap[app0_loc] = lft;
@@ -3982,6 +7732,19 @@ fn handle_sup(state: *ReduceState) Term {
         state.heap[res_loc + 1] = term_new(APP, 0, app1_loc);
 
         state.next = term_new(SUP, sup_lab, res_loc);
+        return dispatch(state);
+    }
+
+    if (p_tag == VAR) {
+        state.heap[p_val] = state.next | SUB_BIT;
+        return dispatch(state);
+    }
+
+    if (p_tag == LET) {
+        state.interactions.* += 1;
+        const bod = state.heap[p_val + 1];
+        state.heap[p_val] = state.next | SUB_BIT;
+        state.next = bod;
         return dispatch(state);
     }
 
@@ -3999,6 +7762,11 @@ fn handle_num(state: *ReduceState) Term {
     const p_ext = term_ext(prev);
     const p_val = term_val(prev);
 
+    if (p_tag == VAR) {
+        state.heap[p_val] = state.next | SUB_BIT;
+        return dispatch(state);
+    }
+
     // CO0/CO1 + NUM: Trivial duplication
     if (p_tag == CO0 or p_tag == CO1) {
         state.interactions.* += 1;
@@ -4014,11 +7782,10 @@ fn handle_num(state: *ReduceState) Term {
             state.next = state.heap[p_val + 1];
         } else {
             const succ = state.heap[p_val + 2];
-            const loc = HVM.heap_pos;
-            HVM.heap_pos += 2;
+            const loc: Val = alloc(2);
             state.heap[loc] = succ;
             state.heap[loc + 1] = term_new(NUM, 0, num_val - 1);
-            state.next = term_new(APP, 0, @truncate(loc));
+            state.next = term_new(APP, 0, loc);
         }
         return dispatch(state);
     }
@@ -4042,6 +7809,14 @@ fn handle_num(state: *ReduceState) Term {
         return dispatch(state);
     }
 
+    if (p_tag == LET) {
+        state.interactions.* += 1;
+        const bod = state.heap[p_val + 1];
+        state.heap[p_val] = state.next | SUB_BIT;
+        state.next = bod;
+        return dispatch(state);
+    }
+
     state.heap[p_val] = state.next;
     return state.next;
 }
@@ -4053,6 +7828,7 @@ fn handle_era(state: *ReduceState) Term {
     state.spos -= 1;
     const prev = state.stack[state.spos];
     const p_tag = term_tag(prev);
+    const p_val = term_val(prev);
 
     // APP + ERA
     if (p_tag == APP) {
@@ -4069,6 +7845,19 @@ fn handle_era(state: *ReduceState) Term {
         return dispatch(state);
     }
 
+    if (p_tag == VAR) {
+        state.heap[p_val] = state.next | SUB_BIT;
+        return dispatch(state);
+    }
+
+    if (p_tag == LET) {
+        state.interactions.* += 1;
+        const bod = state.heap[p_val + 1];
+        state.heap[p_val] = state.next | SUB_BIT;
+        state.next = bod;
+        return dispatch(state);
+    }
+
     state.heap[term_val(prev)] = state.next;
     return state.next;
 }
@@ -4080,6 +7869,7 @@ fn handle_ctr(state: *ReduceState) Term {
     state.spos -= 1;
     const prev = state.stack[state.spos];
     const p_tag = term_tag(prev);
+    const p_val = term_val(prev);
     const tag = term_tag(state.next);
 
     // MAT + CTR: Pattern match
@@ -4093,11 +7883,10 @@ fn handle_ctr(state: *ReduceState) Term {
         var branch = state.heap[mat_loc + 1 + case_idx];
         for (0..arity) |i| {
             const field = state.heap[ctr_loc + i];
-            const loc = HVM.heap_pos;
-            HVM.heap_pos += 2;
+            const loc: Val = alloc(2);
             state.heap[loc] = branch;
             state.heap[loc + 1] = field;
-            branch = term_new(APP, 0, @truncate(loc));
+            branch = term_new(APP, 0, loc);
         }
         state.next = branch;
         return dispatch(state);
@@ -4118,21 +7907,21 @@ fn handle_ctr(state: *ReduceState) Term {
         }
 
         const needed = 3 * arity;
-        const base = HVM.heap_pos;
-        HVM.heap_pos += needed;
+        const base: Val = alloc(@as(u64, needed));
+        const arity_val: Val = @intCast(arity);
 
         for (0..arity) |i| {
-            const idx: Val = @truncate(i);
-            const dup_i: Val = @truncate(base + i);
+            const idx: Val = @intCast(i);
+            const dup_i: Val = base + idx;
             state.heap[dup_i] = state.heap[ctr_loc + idx];
         }
 
-        const ctr0_base: Val = @truncate(base + arity);
-        const ctr1_base: Val = @truncate(base + 2 * arity);
+        const ctr0_base: Val = base + arity_val;
+        const ctr1_base: Val = base + arity_val * 2;
 
         for (0..arity) |i| {
-            const idx: Val = @truncate(i);
-            const dup_i: Val = @truncate(base + i);
+            const idx: Val = @intCast(i);
+            const dup_i: Val = base + idx;
             state.heap[ctr0_base + idx] = term_new(CO0, dup_lab, dup_i);
             state.heap[ctr1_base + idx] = term_new(CO1, dup_lab, dup_i);
         }
@@ -4144,6 +7933,19 @@ fn handle_ctr(state: *ReduceState) Term {
             state.heap[dup_loc] = term_new(tag, ctr_ext, ctr0_base) | SUB_BIT;
             state.next = term_new(tag, ctr_ext, ctr1_base);
         }
+        return dispatch(state);
+    }
+
+    if (p_tag == VAR) {
+        state.heap[p_val] = state.next | SUB_BIT;
+        return dispatch(state);
+    }
+
+    if (p_tag == LET) {
+        state.interactions.* += 1;
+        const bod = state.heap[p_val + 1];
+        state.heap[p_val] = state.next | SUB_BIT;
+        state.next = bod;
         return dispatch(state);
     }
 
@@ -4159,8 +7961,8 @@ fn handle_default(state: *ReduceState) Term {
 /// Direct-threaded dispatch - jump to handler via function pointer
 inline fn dispatch(state: *ReduceState) Term {
     // Follow substitutions first
-    while ((state.next & SUB_BIT) != 0) {
-        state.next = state.heap[term_val(state.next)];
+    if ((state.next & SUB_BIT) != 0) {
+        state.next = state.next & ~SUB_BIT;
     }
     const tag = term_tag(state.next);
     return compiled_handlers[tag](state);
@@ -4178,6 +7980,9 @@ pub fn reduce_compiled(term: Term) Term {
         .stop = HVM.stack_pos,
         .interactions = &interactions,
     };
+    var gc_ctx = GcContext{ .root = &state.next, .stack = state.stack, .spos = &state.spos, .root_heap_loc = null };
+    const gc_prev = gc_push_context(&gc_ctx);
+    defer gc_pop_context(gc_prev);
 
     const result = dispatch(&state);
 
@@ -4214,8 +8019,9 @@ pub fn reduce_beta_chain(term: Term) Term {
 
     while (true) {
         // Follow substitutions
-        while ((next & SUB_BIT) != 0) {
-            next = heap[term_val(next)];
+        if ((next & SUB_BIT) != 0) {
+            next = next & ~SUB_BIT;
+            continue;
         }
 
         const tag = term_tag(next);
@@ -4225,8 +8031,8 @@ pub fn reduce_beta_chain(term: Term) Term {
         var func = heap[app_loc];
 
         // Follow substitutions on function
-        while ((func & SUB_BIT) != 0) {
-            func = heap[term_val(func)];
+        if ((func & SUB_BIT) != 0) {
+            func = func & ~SUB_BIT;
         }
 
         if (term_tag(func) != LAM) return next;

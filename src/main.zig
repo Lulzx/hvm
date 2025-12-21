@@ -9,6 +9,60 @@ const compile = @import("compile.zig");
 const typecheck = @import("typecheck.zig");
 const print = std.debug.print;
 
+const ReduceMode = enum {
+    standard,
+    fast,
+    compiled,
+    parallel,
+    gpu,
+};
+
+fn parseReduceMode(s: []const u8) ?ReduceMode {
+    if (std.mem.eql(u8, s, "standard")) return .standard;
+    if (std.mem.eql(u8, s, "fast")) return .fast;
+    if (std.mem.eql(u8, s, "compiled")) return .compiled;
+    if (std.mem.eql(u8, s, "parallel")) return .parallel;
+    if (std.mem.eql(u8, s, "gpu")) return .gpu;
+    return null;
+}
+
+fn parseCountWithSuffix(s: []const u8) ?u64 {
+    if (s.len == 0) return null;
+
+    var multiplier: u64 = 1;
+    var number_part = s;
+
+    const last = s[s.len - 1];
+    switch (last) {
+        'k', 'K' => {
+            multiplier = 1024;
+            number_part = s[0 .. s.len - 1];
+        },
+        'm', 'M' => {
+            multiplier = 1024 * 1024;
+            number_part = s[0 .. s.len - 1];
+        },
+        'g', 'G' => {
+            multiplier = 1024 * 1024 * 1024;
+            number_part = s[0 .. s.len - 1];
+        },
+        else => {},
+    }
+
+    const base = std.fmt.parseInt(u64, number_part, 10) catch return null;
+    return std.math.mul(u64, base, multiplier) catch null;
+}
+
+fn reduceWithMode(term: hvm.Term, mode: ReduceMode) hvm.Term {
+    return switch (mode) {
+        .standard => hvm.reduce(term),
+        .fast => hvm.reduce_fast(term),
+        .compiled => hvm.reduce_compiled(term),
+        .parallel => hvm.reduce_parallel(term),
+        .gpu => hvm.reduce_gpu(term),
+    };
+}
+
 // =============================================================================
 // Term Display
 // =============================================================================
@@ -232,7 +286,7 @@ fn test_parser(allocator: std.mem.Allocator) !void {
 // File Runner
 // =============================================================================
 
-fn run_file(allocator: std.mem.Allocator, path: []const u8) !void {
+fn run_file(allocator: std.mem.Allocator, path: []const u8, mode: ReduceMode, show_stats: bool) !void {
     // Read file
     const file = std.fs.cwd().openFile(path, .{}) catch |err| {
         print("Error: cannot open file '{s}': {any}\n", .{ path, err });
@@ -262,7 +316,7 @@ fn run_file(allocator: std.mem.Allocator, path: []const u8) !void {
         return;
     }
 
-    const result = hvm.reduce(term.?);
+    const result = reduceWithMode(term.?, mode);
 
     const end = std.time.microTimestamp();
 
@@ -294,19 +348,23 @@ fn run_file(allocator: std.mem.Allocator, path: []const u8) !void {
     print("---\n", .{});
     print("Time: {d} us\n", .{end - start});
     print("Interactions: {d}\n", .{hvm.get_itrs()});
+    if (show_stats) {
+        const stats = hvm.hvm_get_state().getStats();
+        print("Heap: {d}/{d}\n", .{ stats.heap_used, stats.heap_total });
+    }
 }
 
 // =============================================================================
 // Eval (single expression)
 // =============================================================================
 
-fn run_eval(allocator: std.mem.Allocator, code: []const u8) !void {
+fn run_eval(allocator: std.mem.Allocator, code: []const u8, mode: ReduceMode) !void {
     const term = parser.parse(allocator, code) catch |err| {
         print("Parse error: {any}\n", .{err});
         return;
     };
 
-    const result = hvm.reduce(term);
+    const result = reduceWithMode(term, mode);
 
     const pretty_result = parser.pretty(allocator, result) catch {
         show_term(result);
@@ -321,7 +379,7 @@ fn run_eval(allocator: std.mem.Allocator, code: []const u8) !void {
 // Bend File Runner
 // =============================================================================
 
-fn run_bend_file(allocator: std.mem.Allocator, path: []const u8) !void {
+fn run_bend_file(allocator: std.mem.Allocator, path: []const u8, mode: ReduceMode, show_stats: bool, native_bitonic: bool) !void {
     // Read file
     const file = std.fs.cwd().openFile(path, .{}) catch |err| {
         print("Error: cannot open file '{s}': {any}\n", .{ path, err });
@@ -357,9 +415,34 @@ fn run_bend_file(allocator: std.mem.Allocator, path: []const u8) !void {
         return;
     };
 
+    if (native_bitonic) {
+        if (compiler.funcs.get("sort")) |fid| {
+            const state = hvm.hvm_get_state();
+            if (state.fun_arity[fid] == 3) {
+                state.book[fid] = hvm.builtin_bitonic_sort;
+            }
+            hvm.set_native_bitonic_sort_fid(fid);
+        } else {
+            hvm.set_native_bitonic_sort_fid(null);
+        }
+        if (compiler.funcs.get("sum")) |fid| {
+            const state = hvm.hvm_get_state();
+            if (state.fun_arity[fid] == 2) {
+                state.book[fid] = hvm.builtin_bitonic_sum;
+            }
+        }
+        if (compiler.funcs.get("gen")) |fid| {
+            hvm.set_native_bitonic_gen_fid(fid);
+        } else {
+            hvm.set_native_bitonic_gen_fid(null);
+        }
+    } else {
+        hvm.set_native_bitonic_gen_fid(null);
+        hvm.set_native_bitonic_sort_fid(null);
+    }
+
     if (term) |t| {
-        // Use standard reduce
-        const result = hvm.reduce(t);
+        const result = reduceWithMode(t, mode);
         const end = std.time.microTimestamp();
 
         // Print result - show raw term structure first
@@ -397,6 +480,11 @@ fn run_bend_file(allocator: std.mem.Allocator, path: []const u8) !void {
         print("---\n", .{});
         print("Time: {d} us\n", .{end - start});
         print("Interactions: {d}\n", .{hvm.get_itrs()});
+        if (show_stats) {
+            const stats = hvm.hvm_get_state().getStats();
+            print("Heap: {d}/{d}\n", .{ stats.heap_used, stats.heap_total });
+            print("Parallel spawns: {d}\n", .{hvm.get_parallel_spawns()});
+        }
     } else {
         print("No main expression found\n", .{});
     }
@@ -538,59 +626,207 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Initialize HVM
-    try hvm.hvm_init(allocator);
-    defer hvm.hvm_free(allocator);
-
     // Parse command line arguments
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    if (args.len > 1) {
-        const cmd = args[1];
+    var reduce_mode: ReduceMode = .standard;
+    var show_stats: bool = false;
+    var native_bitonic: bool = false;
+    var config: hvm.Config = .{};
+    var positionals: std.ArrayList([]const u8) = .empty;
+    defer positionals.deinit(allocator);
+
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--heap")) {
+            if (i + 1 >= args.len) {
+                print("Error: --heap expects a slot count (e.g. 134217728 or 128M)\n\n", .{});
+                print_help();
+                return;
+            }
+            const v = args[i + 1];
+            config.heap_size = parseCountWithSuffix(v) orelse {
+                print("Error: invalid --heap value '{s}'\n\n", .{v});
+                print_help();
+                return;
+            };
+            i += 1;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--heap=")) {
+            const v = arg["--heap=".len..];
+            config.heap_size = parseCountWithSuffix(v) orelse {
+                print("Error: invalid --heap value '{s}'\n\n", .{v});
+                print_help();
+                return;
+            };
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--stack")) {
+            if (i + 1 >= args.len) {
+                print("Error: --stack expects a slot count (e.g. 16777216 or 16M)\n\n", .{});
+                print_help();
+                return;
+            }
+            const v = args[i + 1];
+            config.stack_size = parseCountWithSuffix(v) orelse {
+                print("Error: invalid --stack value '{s}'\n\n", .{v});
+                print_help();
+                return;
+            };
+            i += 1;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--stack=")) {
+            const v = arg["--stack=".len..];
+            config.stack_size = parseCountWithSuffix(v) orelse {
+                print("Error: invalid --stack value '{s}'\n\n", .{v});
+                print_help();
+                return;
+            };
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--workers")) {
+            if (i + 1 >= args.len) {
+                print("Error: --workers expects a positive integer\n\n", .{});
+                print_help();
+                return;
+            }
+            const v = args[i + 1];
+            const parsed = std.fmt.parseInt(usize, v, 10) catch null;
+            if (parsed == null or parsed.? == 0) {
+                print("Error: invalid --workers value '{s}'\n\n", .{v});
+                print_help();
+                return;
+            }
+            config.num_workers = parsed.?;
+            i += 1;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--workers=")) {
+            const v = arg["--workers=".len..];
+            const parsed = std.fmt.parseInt(usize, v, 10) catch null;
+            if (parsed == null or parsed.? == 0) {
+                print("Error: invalid --workers value '{s}'\n\n", .{v});
+                print_help();
+                return;
+            }
+            config.num_workers = parsed.?;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--stats")) {
+            show_stats = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--gc")) {
+            config.enable_gc = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--native-bitonic")) {
+            native_bitonic = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--fast")) {
+            reduce_mode = .fast;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--compiled")) {
+            reduce_mode = .compiled;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--parallel")) {
+            reduce_mode = .parallel;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--gpu")) {
+            reduce_mode = .gpu;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--reduce")) {
+            if (i + 1 >= args.len) {
+                print("Error: --reduce expects one of: standard, fast, compiled, parallel, gpu\n\n", .{});
+                print_help();
+                return;
+            }
+            const v = args[i + 1];
+            reduce_mode = parseReduceMode(v) orelse {
+                print("Error: invalid --reduce value '{s}' (expected: standard, fast, compiled, parallel, gpu)\n\n", .{v});
+                print_help();
+                return;
+            };
+            i += 1;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--reduce=")) {
+            const v = arg["--reduce=".len..];
+            reduce_mode = parseReduceMode(v) orelse {
+                print("Error: invalid --reduce value '{s}' (expected: standard, fast, compiled, parallel, gpu)\n\n", .{v});
+                print_help();
+                return;
+            };
+            continue;
+        }
+        try positionals.append(allocator, arg);
+    }
+
+    if (positionals.items.len == 0) {
+        // Default: show help
+        print_help();
+        return;
+    }
+
+    const cmd = positionals.items[0];
+    if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
+        print_help();
+        return;
+    }
+
+    // Initialize HVM (after parsing runtime config flags)
+    try hvm.hvm_init_with_config(allocator, config);
+    defer hvm.hvm_free(allocator);
 
         // Check for .hvm file
         if (std.mem.endsWith(u8, cmd, ".hvm")) {
-            try run_file(allocator, cmd);
+            try run_file(allocator, cmd, reduce_mode, show_stats);
             return;
         }
 
         // Check for .bend file
         if (std.mem.endsWith(u8, cmd, ".bend")) {
-            try run_bend_file(allocator, cmd);
+            try run_bend_file(allocator, cmd, reduce_mode, show_stats, native_bitonic);
             return;
         }
 
-        if (std.mem.eql(u8, cmd, "run") and args.len > 2) {
-            const file_path = args[2];
+        if (std.mem.eql(u8, cmd, "run") and positionals.items.len > 1) {
+            const file_path = positionals.items[1];
             if (std.mem.endsWith(u8, file_path, ".bend")) {
-                try run_bend_file(allocator, file_path);
+                try run_bend_file(allocator, file_path, reduce_mode, show_stats, native_bitonic);
             } else {
-                try run_file(allocator, file_path);
+                try run_file(allocator, file_path, reduce_mode, show_stats);
             }
-        } else if (std.mem.eql(u8, cmd, "check") and args.len > 2) {
+        } else if (std.mem.eql(u8, cmd, "check") and positionals.items.len > 1) {
             // Type check a Bend file
-            try check_bend_file(allocator, args[2]);
-        } else if (std.mem.eql(u8, cmd, "compile") and args.len > 2) {
+            try check_bend_file(allocator, positionals.items[1]);
+        } else if (std.mem.eql(u8, cmd, "compile") and positionals.items.len > 1) {
             // Compile Bend to HVM
-            const output = if (args.len > 4 and std.mem.eql(u8, args[3], "-o"))
-                args[4]
+            const output = if (positionals.items.len > 3 and std.mem.eql(u8, positionals.items[2], "-o"))
+                positionals.items[3]
             else
                 null;
-            try compile_bend_file(allocator, args[2], output);
-        } else if (std.mem.eql(u8, cmd, "types") and args.len > 2) {
+            try compile_bend_file(allocator, positionals.items[1], output);
+        } else if (std.mem.eql(u8, cmd, "types") and positionals.items.len > 1) {
             // Show inferred types
-            try check_bend_file(allocator, args[2]);
-        } else if (std.mem.eql(u8, cmd, "eval") and args.len > 2) {
-            try run_eval(allocator, args[2]);
+            try check_bend_file(allocator, positionals.items[1]);
+        } else if (std.mem.eql(u8, cmd, "eval") and positionals.items.len > 1) {
+            try run_eval(allocator, positionals.items[1], reduce_mode);
         } else if (std.mem.eql(u8, cmd, "test")) {
             print_banner();
             run_tests();
         } else if (std.mem.eql(u8, cmd, "parse")) {
             print_banner();
             try test_parser(allocator);
-        } else if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
-            print_help();
         } else if (std.mem.eql(u8, cmd, "bench")) {
             print_banner();
             run_benchmark();
@@ -604,10 +840,6 @@ pub fn main() !void {
             print("Unknown command: {s}\n\n", .{cmd});
             print_help();
         }
-    } else {
-        // Default: show help
-        print_help();
-    }
 }
 
 fn print_banner() void {
@@ -2074,6 +2306,12 @@ fn run_benchmark() void {
                 print("  GPU-resident state allocation failed\n", .{});
                 return;
             };
+            const empty_terms = [_]u64{};
+            const empty_info = [_]u32{};
+            gpu.uploadTemplates(empty_terms[0..], empty_info[0..]) catch {
+                print("  GPU template upload failed\n", .{});
+                return;
+            };
 
             // Benchmark 35: GPU-Resident Heterogeneous Batch
             print("\n35. GPU-Resident Heterogeneous Batch (1M mixed redexes):\n", .{});
@@ -2289,6 +2527,19 @@ fn print_help() void {
         \\HVM4 - Higher-Order Virtual Machine (Zig)
         \\
         \\Usage: hvm4 [command] [options]
+        \\
+        \\Options:
+        \\  --heap=<n>              Heap slots (supports K/M/G suffix)
+        \\  --stack=<n>             Stack slots (supports K/M/G suffix)
+        \\  --workers=<n>           Worker threads for parallel ops
+        \\  --reduce=<mode>         Reducer: standard, fast, compiled, parallel, gpu
+        \\  --gc                    Enable copying GC on heap exhaustion
+        \\  --fast                  Alias for --reduce=fast
+        \\  --compiled              Alias for --reduce=compiled
+        \\  --parallel              Alias for --reduce=parallel
+        \\  --gpu                   Alias for --reduce=gpu
+        \\  --native-bitonic        Use native bitonic sort for Bend sort/3
+        \\  --stats                 Print heap usage stats
         \\
         \\Commands:
         \\  <file.hvm>              Run an HVM file directly
